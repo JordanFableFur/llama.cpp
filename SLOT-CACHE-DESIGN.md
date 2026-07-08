@@ -298,3 +298,55 @@ per-expert-bytes`; slot `S` per tensor is a zeroed dummy (miss sink). Promotion 
 `expert_to_slot[128]` mirror + LRU per layer, updated after decode. Gate on: buffer alloc
 succeeds within VRAM budget (log MiB), and a promoted slot's bytes match the source (memcmp a
 sample). Then M3 (CPU mask-skip op), M4 (oracle), M5 (get_rows wiring), M6 (gates+bench).
+
+### M2 DONE (2026-07-08). Slot buffers + promotion, verified on `experiments/slot-cache` (70f50adbf).
+Gate artifacts: `init: cached 36 CPU-resident MoE layers, 8(+1) slots each, 4084.6 MiB VRAM`;
+`promote self-test (layer 0 expert 0 -> slot 0, gate 4406400 B): MATCH`; off-switch byte-identical.
+
+### M3 SPEC - PAUSE FOR REVIEW (condition 2). CPU mask-skip indexed matmul. No code written yet.
+Does NOT match the addendum verbatim (addendum = 2-sentence prose; this is the concrete op), so
+per the ground rules this is written and pushed for review before implementation.
+
+**Chosen form (least invasive):** reuse `GGML_OP_MUL_MAT_ID` with an OPTIONAL 4th source
+`src[3] = skip_mask`; add one builder; branch only in the CPU forward kernel. No new op enum,
+no other backend touched. Rejected alternatives: a new `GGML_OP_*` (invasive across every
+backend's dispatch); appending a zero dummy expert to the CPU weight (needs a full weight copy,
+defeats the memory point).
+
+**Signature (ggml.c):**
+```
+ggml_tensor * ggml_mul_mat_id_skip(
+    ggml_context * ctx,
+    ggml_tensor  * as,    // [n_embd, n_ff, n_expert]  full expert weights, CPU-resident
+    ggml_tensor  * b,     // [n_embd, n_expert_used, n_tokens]  activations
+    ggml_tensor  * ids,   // [n_expert_used, n_tokens] i32  routed expert ids
+    ggml_tensor  * skip); // [n_expert] i8  1 = expert resident on GPU (skip), 0 = miss (compute)
+```
+Builds a normal MUL_MAT_ID node (same shape inference / dst as `ggml_mul_mat_id(as,b,ids)`) but
+sets `result->src[3] = skip`. `ggml_mul_mat_id` (3-src) is unchanged.
+
+**Semantics (CPU forward):** dst = [n_ff, n_expert_used, n_tokens]. For each token t, used-slot k:
+`e = ids[k,t]`; if `src[3]` present and `skip[e] != 0` -> write dst[:,k,t] = 0 and CONTINUE
+(no read of `as[:,:,e]` - this avoided DDR5 read is the entire win); else compute dst[:,k,t] via
+the existing per-expert matmul inner loop (identical numerics to today's mul_mat_id). When
+`src[3]` is null, behavior is bit-identical to the current kernel. Runs on CPU because `as` is
+CPU-resident; CUDA never sees a 4-src MUL_MAT_ID.
+
+**Combine (in build_moe_ffn, M5):** GPU slot path (mul_mat_id over the S+1 slot buffer, misses ->
+zeroed dummy slot) yields hits-correct/misses-zero; this CPU path yields misses-correct/hits-zero;
+elementwise sum = full result. gate and up each get this treatment; down likewise on the combined
+activations.
+
+**M3 test plan (standalone, before any graph wiring; CPU backend):** construct random
+`as[K,N,E]`, `b`, `ids`, and masks. Gate = all three exact:
+- (a) skip = all-zero  -> output byte-identical to plain `ggml_mul_mat_id(as,b,ids)`.
+- (b) skip = all-one   -> output all zeros.
+- (c) skip = random    -> output equals `plain mul_mat_id` with the skipped (token,k) columns
+  overwritten by zero (reference computed in the test).
+Add as a `test-backend-ops`-style case or a tiny standalone in bench-results/. Only after (a)(b)(c)
+pass does M4/M5 proceed. If any fails: STOP with artifacts (condition 3).
+
+**Open question for reviewer:** skip-mask dtype/semantics - I8 boolean `[n_expert]` (host-derived
+from e2s each token) as above, vs passing the raw `e2s` `[1,n_expert]` i32 and testing
+`e2s[e] != n_slots` in the kernel (one fewer host array, but couples the kernel to the sentinel).
+I lean I8 boolean (kernel stays dumb). Confirm before I build.
