@@ -578,8 +578,32 @@ struct llama_mmap::impl {
     }
 
     void unmap_fragment(size_t first, size_t last) {
-        GGML_UNUSED(first);
-        GGML_UNUSED(last);
+        // Windows has no per-range munmap for a mapped view, but releasing the
+        // pages from the process working set achieves the same goal the loader
+        // wants here: reclaim the parts of the mapping that were uploaded to the
+        // GPU and are no longer read on the CPU. Align inward so we never drop a
+        // page shared with the retained (CPU-resident) range.
+        SYSTEM_INFO si;
+        GetSystemInfo(&si);
+        const size_t page_size = si.dwPageSize;
+
+        size_t offset_in_page = first & (page_size - 1);
+        if (offset_in_page) { first += page_size - offset_in_page; }
+        last &= ~(page_size - 1);
+        if (last <= first) {
+            return;
+        }
+
+        void * ptr = (uint8_t *) addr + first;
+        // VirtualUnlock on a range that was never VirtualLock'd still removes the
+        // pages from the working set; ERROR_NOT_LOCKED is therefore expected here.
+        if (!VirtualUnlock(ptr, last - first)) {
+            DWORD error = GetLastError();
+            if (error != ERROR_NOT_LOCKED) {
+                LLAMA_LOG_WARN("warning: VirtualUnlock failed: %s\n",
+                        llama_format_win_err(error).c_str());
+            }
+        }
     }
 
     ~impl() {
