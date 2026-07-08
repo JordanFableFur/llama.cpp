@@ -1694,6 +1694,10 @@ int llama_context::decode(const llama_batch & batch_inp) {
         return -1;
     }
 
+    if (moe_cache && !moe_cache->initialized) {
+        moe_cache->init(model);
+    }
+
     const auto & vocab   = model.vocab;
     const auto & hparams = model.hparams;
 
