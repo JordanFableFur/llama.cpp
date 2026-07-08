@@ -8,6 +8,9 @@ Measured so far (llama-bench, `-ngl 99 -ncmoe 24 -p 2048 -n 128 -r 3`):
 | baseline (ai-main) | 46.5 ± 1.0 | 12.0 ± 0.0 |
 | prefetch branch, pinning off | 46.8 ± 1.0 | 12.3 ± 0.1 |
 | prefetch + Windows host pinning (`experiments/prefetch-experts-win`) | 54.5 ± 0.2 | 12.4 ± 0.1 |
+| moe-cache branch, `--moe-expert-cache-size 48` (llama-cli, single run) | ~51 | **10.8 — regression** |
+
+moe-cache verdict: do NOT adopt as-is. tg regresses because the branch routes all 36 layers through the cache (de-residenting the 12 free GPU layers) and pays 108 host syncs/token. Fix = Tier 1 #6 (hybrid placement) + Tier 2 #10 (routing snapshot) before re-measuring. Its 48-slot pools also fail to allocate unless ~23 GB VRAM is actually free — check `nvidia-smi` for squatters (ComfyUI/python) before any run.
 
 Key diagnostics behind the ranking:
 - PCIe bus at ~7% utilization during pp (4.3 GB/s of ~55 GB/s practical) — prefill re-streams the same 40.6 GB once per ubatch (4x at default ub=512).
