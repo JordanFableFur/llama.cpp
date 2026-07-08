@@ -1440,6 +1440,16 @@ extern "C" {
             struct ggml_tensor  * b,
             struct ggml_tensor  * ids);
 
+    // like ggml_mul_mat_id, plus a per-expert skip mask (src[3]): skip [n_expert] I8, where
+    // skip[e] != 0 means expert e is not computed and its output rows are written as zeros.
+    // CPU only (CUDA supports_op rejects a 4-src mul_mat_id and falls back).
+    GGML_API struct ggml_tensor * ggml_mul_mat_id_skip(
+            struct ggml_context * ctx,
+            struct ggml_tensor  * as,
+            struct ggml_tensor  * b,
+            struct ggml_tensor  * ids,
+            struct ggml_tensor  * skip);
+
     // A: m columns, n rows,
     // B: p columns, n rows,
     // result is m columns, p rows

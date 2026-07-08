@@ -4630,6 +4630,12 @@ static bool ggml_backend_cuda_device_supports_op(ggml_backend_dev_t dev, const g
         case GGML_OP_MUL_MAT:
         case GGML_OP_MUL_MAT_ID:
             {
+                // the mask-skip variant (ggml_mul_mat_id_skip, src[3] set) is CPU-only; reject it
+                // here so a scheduler misplacement falls back to CPU instead of silently ignoring
+                // the mask and producing non-zero rows the graph expects to be zero.
+                if (op->op == GGML_OP_MUL_MAT_ID && op->src[3] != nullptr) {
+                    return false;
+                }
                 struct ggml_tensor * a = op->src[0];
                 struct ggml_tensor * b = op->src[1];
                 if (a->nb[0] != ggml_element_size(a) || b->nb[0] != ggml_element_size(b)) {

@@ -1538,6 +1538,8 @@ static void ggml_compute_forward_mul_mat_id(
     const struct ggml_tensor * src0 = dst->src[0];
     const struct ggml_tensor * src1 = dst->src[1];
     const struct ggml_tensor * ids = dst->src[2];
+    const struct ggml_tensor * skip = dst->src[3]; // optional [n_expert] I8 skip mask (ggml_mul_mat_id_skip)
+    const int8_t * skip_data = skip ? (const int8_t *) skip->data : NULL;
 
     GGML_TENSOR_BINARY_OP_LOCALS
 
@@ -1634,6 +1636,23 @@ static void ggml_compute_forward_mul_mat_id(
                 matrix_row_counts[i02] += 1;
             }
         }
+
+        // skipped experts (resident in the GPU slot cache) are not computed below; write their
+        // output rows as explicit zeros so the sum with the GPU hit path is correct and never
+        // aliases stale memory.
+        if (skip_data) {
+            for (int cur_a = 0; cur_a < n_as; ++cur_a) {
+                if (!skip_data[cur_a]) {
+                    continue;
+                }
+                const int64_t cne1 = matrix_row_counts[cur_a];
+                for (int64_t i = 0; i < cne1; ++i) {
+                    const struct mmid_row_mapping rm = MMID_MATRIX_ROW(cur_a, i);
+                    float * dst_col = (float *) ((char *) dst->data + rm.i1*nb1 + rm.i2*nb2);
+                    memset(dst_col, 0, ne0*sizeof(float));
+                }
+            }
+        }
     }
 
     // reset current_chunk
@@ -1648,6 +1667,12 @@ static void ggml_compute_forward_mul_mat_id(
         const int64_t cne1 = matrix_row_counts[cur_a];
 
         if (cne1 == 0) {
+            continue;
+        }
+
+        // resident in the GPU slot cache: skip the matmul entirely (this avoids reading the
+        // expert's weights from DDR5 - the whole point). Output rows were zeroed above.
+        if (skip_data && skip_data[cur_a]) {
             continue;
         }
 

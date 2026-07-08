@@ -3332,6 +3332,25 @@ struct ggml_tensor * ggml_mul_mat_id(
     return result;
 }
 
+struct ggml_tensor * ggml_mul_mat_id_skip(
+        struct ggml_context * ctx,
+        struct ggml_tensor  * as,
+        struct ggml_tensor  * b,
+        struct ggml_tensor  * ids,
+        struct ggml_tensor  * skip) {
+    // same as ggml_mul_mat_id, plus an optional per-expert skip mask on src[3].
+    // skip: [n_expert] I8; skip[e] != 0 means expert e is resident elsewhere (GPU slot cache),
+    // so its matmul is not computed and its output rows are written as zeros. The contract is
+    // self-contained (kernel knows nothing about the cache): 1 = skip this expert.
+    GGML_ASSERT(skip->type == GGML_TYPE_I8);
+    GGML_ASSERT(skip->ne[0] == as->ne[2]); // one flag per expert
+
+    struct ggml_tensor * result = ggml_mul_mat_id(ctx, as, b, ids);
+    result->src[3] = skip;
+
+    return result;
+}
+
 // ggml_out_prod
 
 static inline bool ggml_can_out_prod(const struct ggml_tensor * t0, const struct ggml_tensor * t1) {
