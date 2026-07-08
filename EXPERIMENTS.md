@@ -209,3 +209,45 @@ Parked / rejected:
 - Compressed transfer (FloE/Huffman) — MXFP4 already near floor.
 - Draft-model expert speculation — high complexity, predictor (#15) cheaper.
 - Static hot-expert pinning — gpt-oss aggregate routing is near-uniform (skew is per-workload only). CONFIRMED by measurement (item 16): aggregate-across-layers Gini 0.19. But note per-*layer* routing is skewed (Gini 0.72) — static global pinning still loses, yet per-layer REAP pruning may not.
+
+## Session report — 2026-07-08 (unattended Opus run)
+
+Worked items 1, 9, 13, housekeeping, and the item-15 design doc. One benchmark process at a
+time; box was clean (2.9 GB VRAM idle) throughout; no OOM/wedge.
+
+**Landed:**
+- **Item 1 (routing trace + cache sim) — DONE.** `GGML_MOE_TRACE` hook + `simulate-cache.py`;
+  3 workloads traced (wiki 47.7K / code 40.9K / chat 52K tok), hook validated vs imatrix. Verdict:
+  per-layer LRU pools, ~48 slots/layer -> 92-96% hit; cycle-aware eviction refuted; predictor
+  optional. Hook code on `experiments/routing-trace` (bcdbf9402, pushed). Verdict + simulator +
+  full tables on `ai-main`. Raw artifacts in `bench-results/`.
+- **Item 9 (Windows unmap_fragment via VirtualUnlock) — DONE.** Working set 47.2 -> 24.0 GB during
+  generation; tg and temp-0 output unchanged. Code on `experiments/win-mmap-pressure` (51a5a12e6,
+  pushed). Verify logs `bench-results/item9-*.log`, `ws-*.log`.
+- **BENCHMARKS.md — added** to `ai-main` (public clean-box results + methodology + contention warning).
+- **SLOT-CACHE-DESIGN.md — added** to `ai-main` (item-15 proposal synthesizing item 1 + moe-cache
+  post-mortem + issue #20757; staged plan with measurement gates; pre-implementation, needs review).
+
+**Blocked / not done:**
+- **Item 13 (large pages) — BLOCKED.** SeLockMemoryPrivilege not granted; cannot enable or verify
+  headlessly. Documented grant steps + implementation plan (Tier 2 item 13). Not implemented
+  (would be untestable ggml-core code).
+- **Housekeeping 4(b) (sync master from upstream + merge into ai-main) — SKIPPED, needs supervision.**
+  Directly conflicts with this session's ground rules ("do NOT touch master, do NOT interact with
+  upstream ggml-org"). An `upstream` remote (ggml-org) exists, but fetching = interacting with
+  upstream, and advancing master + merging into ai-main is a hard-to-validate operation to run
+  unattended. Left for a supervised session. All local branches ARE pushed and in sync with origin.
+
+**Branch state (all pushed to origin except noted):**
+- `ai-main` — head of the queue; item 1/9/13 verdicts, BENCHMARKS.md, SLOT-CACHE-DESIGN.md, simulator.
+- `experiments/routing-trace` (bcdbf9402) — MoE trace hook (item 1 code).
+- `experiments/win-mmap-pressure` (51a5a12e6) — VirtualUnlock unmap_fragment (item 9 code).
+- `experiments/win-fast-load` (f1d3aa3dd) — has_direct_io()->false (prior session).
+- `experiments/prefetch-experts-win` (394cec7cc) — Windows host pinning (the ~2x pp win; prior session).
+- `experiments/prefetch-experts` (5f83fbbe7), `experiments/moe-cache` (9cf4f1a9f) — prior sessions.
+- `master` — untouched, mirrors origin/master (bec4772f6).
+
+**Next session (recommended order):** (1) supervised: master ff-sync + merge to ai-main. (2) begin
+item 15 phase 0/1 per SLOT-CACHE-DESIGN.md (telemetry gate first). (3) if a human grants
+SeLockMemoryPrivilege, revisit item 13. (4) consider PRs for routing-trace and win-mmap-pressure
+(both verified, self-contained).
