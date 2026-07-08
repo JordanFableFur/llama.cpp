@@ -210,3 +210,45 @@ output, online hit rate matches sim +/-5%, tg >= ~35 floor). This is a dedicated
 verification-heavy CUDA effort - appropriate for a run scoped *only* to phase 1, and arguably
 worth a human design check on the custom-op shape first (it is a new pattern per AGENTS.md).
 Not attempted unattended-and-unverified in this session.
+
+### Review addendum (Fable, 2026-07-08) — option (c), and a broken gate fixed
+
+**Stopping was correct; phase 0 passing validates the design's core assumption in-engine.**
+Two additions before the supervised phase-1 session:
+
+**Option (c) — static graph via slot-map indirection; evaluate BEFORE committing to (a).**
+The hit/miss split does not need to be decided at graph-build time if the indirection is a
+*data* dependency instead of a *structure* one:
+
+1. Per CPU layer, keep `expert_to_slot` as a small GPU tensor (128 x i32): slot index for
+   resident experts, a dummy-slot sentinel for misses. Slot buffers get one extra zeroed
+   dummy slot.
+2. In the graph: `slot_ids = ggml_get_rows(expert_to_slot, selected_experts)` — on-device,
+   no sync. GPU path: the EXISTING `mul_mat_id` over the slot buffer (S+1 experts) indexed
+   by `slot_ids`. Misses land in the zero dummy slot and contribute nothing. No new CUDA op.
+3. Miss path: the CPU `mul_mat_id` already runs per layer today (ids reach the CPU backend
+   via the scheduler's existing cross-backend copy — this sync is the status quo that yields
+   41 tg, not a new cost). Add a *mask-skip variant* of the CPU kernel (plain C, small):
+   takes a miss-mask input and skips resident experts' rows — that skip IS the win (the
+   DDR5 reads it avoids). Outputs combine by summation exactly as today's weighted sum.
+4. Host side per layer: update LRU from ids (already host-visible on this path), async-upload
+   the 512-byte map, event-ordered after the promotion copy so a stale map costs an extra
+   miss, never a wrong result.
+
+Cost comparison: (c) reuses two battle-tested kernels + one small C variant + graph wiring;
+(a) is a new gather+matmul CUDA op. AGENTS.md's "prefer reusing existing infrastructure"
+points at (c). Check first: CUDA `ggml_get_rows` must support I32 sources (if not, that
+one small kernel is still far less than (a)). If (c) benches poorly (e.g. the per-layer CPU
+op dependency dominates at high hit rates), (a) remains the fallback — decide on phase-1
+measurements, not taste.
+
+**Gate fix — "byte-identical vs baseline" is unsatisfiable and would fail a correct
+implementation.** Moving hit experts from CPU to GPU legitimately changes numerics (different
+kernels, FMA order, dequant path) even when perfectly correct. Replace with:
+- byte-identical vs **the option-(b) host-sync oracle** (same placement, same kernels — build
+  (b) first as a throwaway; this is what (b) is for);
+- token-agreement and perplexity-delta-within-noise vs ai-main baseline (catches real bugs,
+  tolerates legitimate numeric drift).
+
+Phase-1 supervised session: implement (b) oracle → implement (c) → gate (c) against (b) →
+bench; escalate to (a) only if (c)'s measured overhead demands it.
