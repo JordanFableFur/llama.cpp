@@ -77,12 +77,16 @@ Per-lever verdict (clean box):
 
 Clean-box measurement changed the priorities. pp is already ~1790 (fa+ub2048+pin); tg ~37 and bandwidth-bound. Ranking by value/risk against the clean baseline:
 
-1. **Item 14 — Windows overlapped unbuffered loader.** Low risk (I/O only, no extra memory → no OOM/wedge path), 4× cold load. Compounds every future bench. Ship the honest `has_direct_io()→false` interim first. **[executing overnight, branch `experiments/win-fast-load`]**
-2. **Item 12 — pinned-staging bounce for the unpinned fragment.** Tier 0 proved it: shard 3's 7–10 GB CPU experts fail to pin (36 GB cap) and stream pageable during pp. Route them through a cudaHostAlloc ring. Top *pp* code win at ncmoe 24. Env-gated (default off). **[executing overnight if #14 clean, branch `experiments/pinned-bounce`]**
-3. **Item 13 — large pages (MEM_LARGE_PAGES) for CPU experts, env-gated.** Downgraded: tg is bandwidth-bound now, not TLB-bound, so the +5–15% estimate is optimistic. Still a clean default-off hypothesis test.
-4. **Items 6/7/10/11 (moe-cache) — PARKED** per owner (skip moe-cache as-is). Also: their premise ("tg 12→18-25") is void — clean tg is already 37. Revisit only if a fundamentally different design (item 15) is attempted.
-5. **Item 8 — KILLED** (E-core exclusion regresses this workload, see Tier 0 item 3).
-6. **Item 15 (persistent GPU slot cache) / Item 16 (REAP pruning)** — flagship/offline, unchanged in principle but re-baseline against ~37 tg before projecting gains. Beyond one night.
+Code anchors from tonight's source read are inline so these are executable, not aspirational.
+
+1. **Item 14 interim — `has_direct_io()→false` on Windows** (`src/llama-mmap.cpp:173`). The Windows `llama_file::impl` ctor (`:86`) opens a buffered `FILE*` and `read_raw` (`:129`) always uses cached `ReadFile`; `has_direct_io()` returned `true`, a pure lie only consulted under `--direct-io` (`llama-model-loader.cpp:565`, default off). Safe honesty fix. **[DONE this session, branch `experiments/win-fast-load`, building `build-fastload`.]**
+2. **Item 14 real — overlapped unbuffered loader. CORRECTED VALUE: only helps `--no-mmap --direct-io`.** Our benches use mmap (default), which faults pages in / PrefetchVirtualMemory — it never calls `read_raw` for bulk weights. So the "4× cold load" does NOT speed our mmap iteration. Still a legit contribution for no-mmap users, but deprioritized for this workload. Verify via deterministic `--no-mmap --direct-io` output-diff.
+3. **Item 9 — mmap PrefetchVirtualMemory clamp (PROMOTED: this is the real mmap-path load-time win).** Loader prefetches the whole 59 GB even though ~21 GB is uploaded to GPU and freed; clamp the prefetch to the CPU-resident range + `VirtualUnlock` GPU-uploaded ranges (`unmap_fragment` is a Windows no-op today). Touches the path we actually use; lower risk than #4 (Win32 mmap hints, no cudaMemcpy landmine). Verify: cold-load time + output-diff. **Recommended next code target.**
+4. **Item 12 — pinned-staging bounce for the unpinned fragment.** Tier 0 proved it: every ncmoe pins the same 29,681 MiB (shard 2) and leaves shard 3's 7–10 GB CPU experts pageable (`register_host` is per-mapping, `llama-mmap.cpp:634`; all-or-nothing). Route unregistered sources through a 2×64 MB `cudaHostAlloc` ring. Top *pp* win, but sits ON the documented "cudaMemcpyAsync source must lie in one registered region → invalid argument" crash landmine. **NOT to be landed unattended — needs a supervised session.** Env-gated (default off).
+5. **Item 13 — large pages for CPU experts, env-gated.** Downgraded: tg is bandwidth-bound now, not TLB-bound, so +5–15% is optimistic. Clean default-off hypothesis test.
+6. **Items 6/7/10/11 (moe-cache) — PARKED** per owner. Premise ("tg 12→18-25") is void — clean tg is already 37/41. Revisit only under a different design (item 15).
+7. **Item 8 — KILLED** (E-core exclusion regresses this workload, Tier 0 item 3).
+8. **Item 15 (persistent GPU slot cache) / Item 16 (REAP pruning)** — flagship/offline; re-baseline against ~41 tg (ncmoe 22) before projecting gains. Beyond one night.
 
 ## Tier 1 — small patches, high confidence
 
