@@ -150,6 +150,7 @@ endif ()
 
 # uses only the public ggml API, so it is safe on the Windows shared-lib build too
 llama_build_and_test(test-mul-mat-id-skip.cpp)
+llama_build_and_test(test-slot-matmul.cpp)
 
 if (NOT WIN32 OR NOT BUILD_SHARED_LIBS)
     # these tests are disabled on Windows because they use internal functions not exported with LLAMA_API (when building with shared libraries)
