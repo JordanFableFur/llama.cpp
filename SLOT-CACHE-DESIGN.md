@@ -350,3 +350,26 @@ pass does M4/M5 proceed. If any fails: STOP with artifacts (condition 3).
 from e2s each token) as above, vs passing the raw `e2s` `[1,n_expert]` i32 and testing
 `e2s[e] != n_slots` in the kernel (one fewer host array, but couples the kernel to the sentinel).
 I lean I8 boolean (kernel stays dumb). Confirm before I build.
+
+### M3 DONE (2026-07-08). ggml_mul_mat_id_skip, verified on `experiments/slot-cache` (80dc387b2).
+Gates (tests/test-mul-mat-id-skip.cpp): (a) zero-mask==plain, (b) one-mask==zero, (c) random==ref,
+(d) mask-mutation tracks - ALL PASS. CUDA supports_op rejects 4-src MUL_MAT_ID. Off-switch identical.
+
+### M4 RULING (2026-07-08, owner-approved): host-sync (b) oracle dropped; replaced by gate structure below.
+A faithful host-sync (b) would need to read selected_experts mid-eval and rebuild per-layer dispatch
+- the exact static-graph machinery (c) exists to avoid - so it cannot serve as an independent
+reference. Replaced by two byte-exact gates that together cover what (b) would have, without a
+throwaway path:
+- **M5 (whole-graph byte gate):** option-(c) wiring with a FORCED-EMPTY cache -> e2s all-dummy
+  (get_rows sends every expert to the zeroed dummy slot, GPU path contributes 0) and skip_mask
+  all-zero (CPU mul_mat_id_skip computes every expert = plain mul_mat_id). Sum == baseline,
+  byte-identical. Exercises the indirection, dummy-slot zeroing, mask plumbing, and the combine.
+- **M5b (unit byte gate, same-device):** standalone CUDA test (M3 style). Promote a known expert
+  set into a slot buffer, build e2s, compare `mul_mat_id(slots, x, remap(ids))` vs
+  `mul_mat_id(full, x, ids)` on CUDA - hit rows byte-identical, miss rows zero. Same device/kernel/
+  dtype sidesteps CPU-vs-GPU numerics and gives the HIT path (promoted-slot compute + get_rows
+  remap + slot indexing) the same exactness standard. Stronger than M2's byte-copy check, which
+  only verified the copied bytes, not the compute that indexes them.
+- **M6 (statistical gates):** real promotion -> token-agreement + ppl-within-noise vs baseline,
+  online hit rate matches the Phase-0 sim (GGML_MOE_CACHE_SIM), tg >= ~35 floor.
+Build order: M5b first (de-risks the slot primitive), then M5 wiring, then M6.
