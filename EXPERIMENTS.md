@@ -103,9 +103,86 @@ Code anchors from tonight's source read are inline so these are executable, not 
 13. **Large pages (MEM_LARGE_PAGES)** for CPU expert weights (--no-mmap path + SeLockMemoryPrivilege), env-gated. ~300K 4K-page touches/token today; 2 MB pages fix STLB. Est. +5-15% tg. (windows agent idea 2)
 14. **Windows unbuffered overlapped load** (--direct-io is silently fake on Windows today — has_direct_io() returns true, ctor ignores it): FILE_FLAG_NO_BUFFERING + OVERLAPPED QD8+. Cold load ~60s → ~10-15s. Interim honest fix: return false. (windows agent idea 4)
 
+## Item 1 results — routing trace + offline cache simulation (2026-07-08)
+
+Design data for item 15. Env-gated hook `GGML_MOE_TRACE=<file>` (`common/moe-trace.cpp`,
+installed via the existing eval-callback path when no other callback is present) records the
+routed expert ids of each MoE layer's gate `mul_mat_id`, per token, in sequence order.
+`simulate-cache.py` replays a trace through cache policies at several slot budgets.
+
+**Capture is at DECODE.** During batched prefill the eval callback only fires for
+GPU-resident-expert layers (a backend-split artifact); single-token evals fire all 36 layers.
+So wiki/code traces feed the corpus as single-token decode steps (`-b 1 -ub 1`, teacher-forced)
+and chat is free generation. Routing is placement-independent, so runs use `-ncmoe 36` (experts
+on CPU) to free VRAM for a 98K context. Raw traces + logs in `bench-results/{wiki,code,chat*}.trace`,
+`trace-*.log`, sim in `bench-results/cache-sim.log`.
+
+**Hook validated** against imatrix per-expert counts (`simulate-cache.py verify`): wikitext
+corr **0.94** / gini-diff **0.03**, code corr **0.83** / gini-diff **0.024**. Gini (skew
+magnitude) matches almost exactly; sub-1.0 correlation is the trace being a ~45K-token slice at
+full context vs the imatrix's full corpus in 512-tok chunks. Rules out transposition / layer-shift.
+
+Hit-rate (%) = resident-expert requests / (tokens x 36 layers x 4). Slots are **per layer**;
+"shared" = one pool of `slots x 36` across all layers. Per-layer least-stale == per-layer LRU
+(one access/layer/token), so it is not shown separately.
+
+wikitext (47.7K tok):
+
+| slots/layer | 8 | 16 | 24 | 32 | 48 | 64 |
+|---|---|---|---|---|---|---|
+| perlayer LRU      | 45.6 | 64.5 | 75.4 | 82.9 | 92.0 | 96.6 |
+| perlayer LFU-decay| 49.3 | 67.9 | 77.5 | 84.0 | 92.3 | 96.7 |
+| perlayer ORACLE   | 65.1 | 80.4 | 87.8 | 92.1 | 96.7 | 98.6 |
+| shared LRU        | 44.4 | 64.6 | 76.2 | 84.4 | 93.8 | 97.9 |
+| shared CYCLE      | 40.4 | 61.5 | 74.7 | 83.6 | 93.6 | 97.8 |
+| shared ORACLE     | 69.1 | 82.7 | 89.6 | 93.7 | 97.7 | 99.2 |
+
+code (40.9K tok):
+
+| slots/layer | 8 | 16 | 24 | 32 | 48 | 64 |
+|---|---|---|---|---|---|---|
+| perlayer LRU      | 39.6 | 59.0 | 74.3 | 83.9 | 93.4 | 97.1 |
+| perlayer LFU-decay| 46.0 | 66.6 | 77.6 | 85.2 | 93.6 | 97.1 |
+| perlayer ORACLE   | 61.2 | 79.1 | 87.9 | 92.7 | 97.1 | 98.7 |
+| shared LRU        | 39.5 | 58.1 | 75.1 | 84.7 | 94.1 | 97.5 |
+| shared CYCLE      | 37.8 | 58.5 | 74.0 | 84.0 | 93.7 | 97.3 |
+| shared ORACLE     | 65.5 | 81.4 | 89.4 | 93.8 | 97.6 | 99.0 |
+
+chat (52.0K tok, 4 merged generations):
+
+| slots/layer | 8 | 16 | 24 | 32 | 48 | 64 |
+|---|---|---|---|---|---|---|
+| perlayer LRU      | 62.7 | 80.8 | 87.1 | 91.6 | 95.8 | 98.0 |
+| perlayer LFU-decay| 68.5 | 83.1 | 88.5 | 92.3 | 96.0 | 98.0 |
+| perlayer ORACLE   | 78.1 | 89.6 | 93.8 | 96.1 | 98.2 | 99.1 |
+| shared LRU        | 60.1 | 81.1 | 87.1 | 92.0 | 96.3 | 98.2 |
+| shared CYCLE      | 62.8 | 80.4 | 87.3 | 91.6 | 96.1 | 98.2 |
+| shared ORACLE     | 81.7 | 90.8 | 94.7 | 96.6 | 98.5 | 99.3 |
+
+**Verdict (decides the item-15 design):**
+- **Per-layer independent pools ~= shared pool** (within ~1-2 pts everywhere). The per-layer
+  design wins on simplicity — no cross-layer slot map, no global eviction bookkeeping. Build it
+  per-layer.
+- **Plain LRU is sufficient; layer-cycle-aware eviction is REFUTED.** shared CYCLE ties or loses
+  to shared LRU on all three workloads (e.g. wiki 8-slot 40.4 vs 44.4). The "LRU provably wrong"
+  premise needs the pool to be smaller than one layer-cycle's working set; at these budgets it is
+  not, so LRU never evicts a soon-needed expert. LFU-decay adds only +4-6 pts and only at tight
+  budgets (<=16 slots); at practical budgets it ties LRU. Use LRU.
+- **Sizing: 48 slots/layer (37.5% of 128 experts) -> 92-96% hit across all workloads; 64 -> 96-98%.**
+  Below 32 slots workload sensitivity is large (chat 62.7% vs code 39.6% at 8 slots), but all
+  workloads converge by 48. This is the Gini-0.72 per-layer skew paying off, and it confirms the
+  cache is robust across workloads (unlike static REAP pruning, item 16).
+- **Predictor headroom (ORACLE - LRU) ~= 4-9 pts at 32 slots, shrinking to 2-5 pts at 48.** The
+  optional pre-attention MLP prefetcher (item 15) is a secondary optimization; a plain LRU cache
+  already captures most of the achievable hit rate.
+- **Caveat:** hit rate is necessary but not sufficient for a tg win. The moe-cache post-mortem
+  (108 host syncs/token) shows a naive implementation erases the benefit. Item 15 must keep the
+  hot path sync-free (persistent slot residency, async promote on miss). Do NOT project a tg
+  number from hit rate alone — measure it.
+
 ## Tier 3 — the flagship project
 
-15. **Persistent GPU expert slot cache** (upstream issue #20757 design + literature): fixed slot pool across all layers, persistent expert→slot map across tokens, miss = compute on CPU now + async promote for later (arXiv 2512.16473), eviction = least-stale/layer-cycle-aware (SpecMD 2602.03921, LRU provably wrong), optional pre-attention expert predictor for prefetch lead time (2511.10676: 93-97% top-4 accuracy from a 2-layer MLP). Prototype on an 8 GB card hit 98-100% steady-state hits and 12-14 t/s on this model; projected 25-40 t/s tg here. Build on moe-cache branch after #6/#10 or fresh. **Now the top Tier 3 target** (item 16/REAP rejected). Measurement support: per-layer routing Gini 0.72 (a small slot pool captures most traffic) + 29% cross-domain overlap (static pruning fails, but a dynamic cache adapts per workload) — exactly the regime a slot cache wins in. Baseline to beat is now 41 tg (ncmoe 22, clean), not the stale 12.
+15. **Persistent GPU expert slot cache** (upstream issue #20757 design + literature). **Design now fixed by item 1 measurement (2026-07-08):** build **per-layer independent LRU slot pools** (per-layer ~= shared within 1-2 pts, far simpler; cycle-aware eviction refuted — ties/loses to LRU), size **~48 slots/layer** (37.5% of 128 experts -> 92-96% hit across wiki/code/chat; 64 -> 96-98%). Miss = compute on CPU now + async promote for later (arXiv 2512.16473). Optional pre-attention expert predictor (2511.10676: 93-97% top-4 accuracy from a 2-layer MLP) buys only ~4-9 pts (oracle-LRU gap) at 32 slots, shrinking with budget — secondary, not core. Prototype on an 8 GB card hit 98-100% steady-state hits and 12-14 t/s on this model. Build on moe-cache branch after #6/#10 or fresh; keep the hot path sync-free (the moe-cache 108-syncs/token post-mortem is the failure mode). **Top Tier 3 target** (item 16/REAP rejected). Baseline to beat is 41 tg (ncmoe 22, clean). Hit rate is necessary but not sufficient — measure tg, do not project it.
 16. **REAP expert pruning** (2510.13999, ICLR 2026). **Corrected + partially measured 2026-07-08.**
     - **NOT "GGUF surgery."** Cerebras tooling (github.com/CerebrasResearch/reap) operates on **HF PyTorch/safetensors**, needs the original gpt-oss HF checkpoint (not our GGUF), runs calibration forward passes on the full model (brutal on one 32 GB card), wants 24,576 samples × 16k tok, and **gpt-oss arch is not in their MODEL_ATTRS** (would need porting). gpt-oss was **not** among their evaluated models (Qwen3-Coder, GLM, Mixtral, Llama-4, Kimi); no released gpt-oss checkpoint. So item 16 = a multi-day HF port + re-quant to MXFP4 GGUF, not an afternoon.
     - Saliency: `S_j = mean_x[ g_j(x) · ||f_j(x)||_2 ]` (router gate × expert output L2 norm). Prune min-S experts per layer. Paper notes frequency-based pruning fails on uniform routing; REAP's saliency is meant to handle non-uniform.
