@@ -252,3 +252,31 @@ kernels, FMA order, dequant path) even when perfectly correct. Replace with:
 
 Phase-1 supervised session: implement (b) oracle → implement (c) → gate (c) against (b) →
 bench; escalate to (a) only if (c)'s measured overhead demands it.
+
+## Phase 1 execution log (2026-07-08, supervised run)
+
+**Feasibility gate PASSED.** CUDA `get_rows` supports I32 src0 (`ggml/src/ggml-cuda/getrows.cu:195`)
+and asserts I32 indices - so `slot_ids = get_rows(expert_to_slot, selected_experts)` works
+on-device, no new kernel. Option (c) is viable.
+
+**Integration surface (from src/llama-graph.{h,cpp}).** `build_moe_ffn` receives `up_exps /
+gate_exps / down_exps` (residency = `ggml_backend_buffer_is_host`) and computes
+`selected_experts` internally at ~line 1894; expert matmuls are `build_lora_mm_id(..., selected_experts, ...)`
+at ~1975/1988/down. Blocker: `llm_graph_context` is per-graph/transient and carries no mutable
+persistent handle (`hparams`/`cparams` are const refs; no `llama_context*`/`llama_model*`). The
+slot cache persists across tokens, so it needs a persistent home threaded into the builder.
+
+**Component milestones:**
+- M1. Persistent cache object (owns per-layer slot buffers, expert_to_slot, LRU), reachable from build_moe_ffn.
+- M2. GPU slot buffers: 3 per CPU layer, S+1 experts (slot S = zeroed dummy for misses); alloc + populate + synchronous promotion (raw MXFP4 row copy from the mmap'd weight).
+- M3. CPU mask-skip mul_mat_id variant (ggml-cpu) - the skip of resident-expert rows IS the bandwidth win.
+- M4. Option (b) host-sync oracle driver (correctness reference).
+- M5. Option (c) get_rows indirection wiring (gate/up/down) + combine.
+- M6. Gates: (c) byte-identical vs (b); token-agreement + ppl-within-noise vs baseline; tg bench (>= ~35 floor, then equal-VRAM).
+
+**Two decisions flagged for supervision (AGENTS.md: pause on invasive / new-pattern changes):**
+- D1 (plumbing): thread a persistent cache through core classes (clean but invasive) vs a
+  file-scoped cache keyed by tensor pointer (matches the GGML_MOE_TRACE hook precedent;
+  contained; slightly hacky). Blocks all code.
+- D2 (miss compute): a new CPU mask-skip op is REQUIRED for a real tg win (reusing the full CPU
+  matmul and subtracting hits saves no DDR5 bandwidth). Confirmed necessary, not optional.
