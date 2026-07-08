@@ -2,6 +2,7 @@
 
 #include "llama-impl.h"
 #include "llama-model.h"
+#include "llama-moe-slot-cache.h"
 #include "llama-batch.h"
 #include "llama-cparams.h"
 
@@ -1949,6 +1950,35 @@ ggml_tensor * llm_graph_context::build_moe_ffn(
         cb(cur, "ffn_moe_weighted", il);
     }
 
+    // Persistent GPU expert slot cache (item 15). For CPU-resident MoE layers with an active
+    // cache, split each expert matmul into: GPU path over the slot buffer (routed ids remapped
+    // to slot ids via get_rows(e2s); misses land in the zeroed dummy slot -> contribute 0) plus
+    // CPU path over the full weights with mul_mat_id_skip (resident experts skipped -> the DDR5
+    // saving), summed. With an empty cache (e2s all-dummy, skip all-zero) this is byte-identical
+    // to build_lora_mm_id. Falls through unchanged when uncached / scaled / LoRA'd / non-contiguous.
+    auto moe_expert_mm = [&](ggml_tensor * w, ggml_tensor * in, ggml_tensor * w_s) -> ggml_tensor * {
+        const llama_moe_slot_cache::layer_slots * ls = moe_cache ? moe_cache->find(il) : nullptr;
+        if (ls && !w_s && ggml_is_contiguous(selected_experts)) {
+            bool has_lora = false;
+            for (const auto & lora : *loras) {
+                if (lora.first->get_weight(w)) { has_lora = true; break; }
+            }
+            ggml_tensor * slot = (w == ls->src_gate) ? ls->gate :
+                                 (w == ls->src_up)   ? ls->up   :
+                                 (w == ls->src_down) ? ls->down : nullptr;
+            if (slot && !has_lora) {
+                const int64_t neu = selected_experts->ne[0];
+                const int64_t nt  = selected_experts->ne[1];
+                ggml_tensor * flat = ggml_reshape_1d(ctx0, selected_experts, neu*nt);
+                ggml_tensor * sid  = ggml_reshape_2d(ctx0, ggml_get_rows(ctx0, ls->e2s, flat), neu, nt);
+                ggml_tensor * gpu  = ggml_mul_mat_id(ctx0, slot, in, sid);
+                ggml_tensor * cpu  = ggml_mul_mat_id_skip(ctx0, w, in, selected_experts, ls->skip);
+                return ggml_add(ctx0, gpu, cpu);
+            }
+        }
+        return build_lora_mm_id(w, in, selected_experts, w_s);
+    };
+
     ggml_tensor * up = nullptr;
     ggml_tensor * experts = nullptr;
 
@@ -1973,7 +2003,7 @@ ggml_tensor * llm_graph_context::build_moe_ffn(
         cb(up, "ffn_moe_up", il);
     } else {
         // separate gate and up path
-        up = build_lora_mm_id(up_exps, cur, selected_experts, up_exps_s); // [n_ff, n_expert_used, n_tokens]
+        up = moe_expert_mm(up_exps, cur, up_exps_s); // [n_ff, n_expert_used, n_tokens]
         cb(up, "ffn_moe_up", il);
 
         if (up_exps_s) {
@@ -1986,7 +2016,7 @@ ggml_tensor * llm_graph_context::build_moe_ffn(
         }
 
         if (gate_exps) {
-            cur = build_lora_mm_id(gate_exps, cur, selected_experts, gate_exps_s); // [n_ff, n_expert_used, n_tokens]
+            cur = moe_expert_mm(gate_exps, cur, gate_exps_s); // [n_ff, n_expert_used, n_tokens]
             cb(cur, "ffn_moe_gate", il);
         } else {
             cur = up;
@@ -2075,7 +2105,7 @@ ggml_tensor * llm_graph_context::build_moe_ffn(
             GGML_ABORT("fatal error");
     }
 
-    experts = build_lora_mm_id(down_exps, cur, selected_experts, down_exps_s); // [n_embd, n_expert_used, n_tokens]
+    experts = moe_expert_mm(down_exps, cur, down_exps_s); // [n_embd, n_expert_used, n_tokens]
     cb(experts, "ffn_moe_down", il);
 
     if (down_exps_s) {

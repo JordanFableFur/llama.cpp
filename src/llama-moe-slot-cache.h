@@ -26,14 +26,15 @@ struct llama_moe_slot_cache {
         ggml_tensor * gate = nullptr;   // [n_embd, n_ff,  n_slots+1] on GPU (slot n_slots = zeroed dummy)
         ggml_tensor * up   = nullptr;   // [n_embd, n_ff,  n_slots+1]
         ggml_tensor * down = nullptr;   // [n_ff,   n_embd, n_slots+1]
-        ggml_tensor * e2s  = nullptr;   // [1, n_expert] i32: expert -> slot, value n_slots = miss
+        ggml_tensor * e2s  = nullptr;   // [1, n_expert] i32 (GPU): expert -> slot, value n_slots = miss
+        ggml_tensor * skip = nullptr;   // [n_expert] I8 (CPU): 1 = resident (mul_mat_id_skip skips it)
 
         // source expert weights (CPU-resident, host-readable), promotion copies from these
         ggml_tensor * src_gate = nullptr;
         ggml_tensor * src_up   = nullptr;
         ggml_tensor * src_down = nullptr;
 
-        std::vector<int32_t> e2s_host;  // host mirror of e2s (LRU bookkeeping lands here in M4/M5)
+        std::vector<int32_t> e2s_host;  // host mirror of e2s (LRU bookkeeping lands here in M6)
     };
 
     std::vector<layer_slots>             layers;
@@ -46,6 +47,16 @@ struct llama_moe_slot_cache {
 
     // lazily allocate slot buffers for every CPU-resident MoE layer of the model (idempotent)
     void init(const llama_model & model);
+
+    // cache entry for layer il, or nullptr if that layer is not cached
+    const layer_slots * find(int il) const {
+        for (const auto & ls : layers) {
+            if (ls.il == il) {
+                return &ls;
+            }
+        }
+        return nullptr;
+    }
 
     // synchronous promotion: copy expert_id's weights into slot on the GPU (phase 1)
     void promote(layer_slots & ls, int expert_id, int slot);

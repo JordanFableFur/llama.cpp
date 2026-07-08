@@ -92,9 +92,46 @@ void llama_moe_slot_cache::init(const llama_model & model) {
         ls.e2s_host.assign(n_expert, n_slots);   // all experts -> dummy miss slot initially
         ggml_backend_tensor_set(ls.e2s, ls.e2s_host.data(), 0, ggml_nbytes(ls.e2s));
 
+        // the dummy slot (index n_slots) is the miss sink: zero it so missed experts contribute
+        // nothing to the GPU path. (Unpromoted real slots are never indexed until promoted.)
+        {
+            std::vector<char> z(ls.gate->nb[2], 0);
+            ggml_backend_tensor_set(ls.gate, z.data(), (size_t) n_slots * ls.gate->nb[2], ls.gate->nb[2]);
+            z.assign(ls.up->nb[2], 0);
+            ggml_backend_tensor_set(ls.up,   z.data(), (size_t) n_slots * ls.up->nb[2],   ls.up->nb[2]);
+            z.assign(ls.down->nb[2], 0);
+            ggml_backend_tensor_set(ls.down, z.data(), (size_t) n_slots * ls.down->nb[2], ls.down->nb[2]);
+        }
+
         ctxs.emplace_back(ctx);
         bufs.emplace_back(buf);
         layers.push_back(std::move(ls));
+    }
+
+    // skip masks live on the CPU (read by mul_mat_id_skip, which runs on CPU with the CPU-resident
+    // weights); one small I8 [n_expert] tensor per cached layer, all in one CPU buffer.
+    if (!layers.empty()) {
+        ggml_init_params ipc = {
+            /*.mem_size   =*/ (layers.size() + 1) * ggml_tensor_overhead(),
+            /*.mem_buffer =*/ nullptr,
+            /*.no_alloc   =*/ true,
+        };
+        ggml_context * ctx_cpu = ggml_init(ipc);
+        for (auto & ls : layers) {
+            ls.skip = ggml_new_tensor_1d(ctx_cpu, GGML_TYPE_I8, n_expert);
+        }
+        ggml_backend_buffer_t buf_cpu = ggml_backend_alloc_ctx_tensors_from_buft(ctx_cpu, ggml_backend_cpu_buffer_type());
+        if (!buf_cpu) {
+            LLAMA_LOG_ERROR("%s: skip-mask CPU buffer alloc FAILED\n", __func__);
+            ggml_free(ctx_cpu);
+            return;
+        }
+        std::vector<int8_t> zeros(n_expert, 0);
+        for (auto & ls : layers) {
+            ggml_backend_tensor_set(ls.skip, zeros.data(), 0, ggml_nbytes(ls.skip)); // empty: skip nothing
+        }
+        ctxs.emplace_back(ctx_cpu);
+        bufs.emplace_back(buf_cpu);
     }
 
     LLAMA_LOG_INFO("%s: cached %zu CPU-resident MoE layers, %d(+1) slots each, %.1f MiB VRAM\n",
