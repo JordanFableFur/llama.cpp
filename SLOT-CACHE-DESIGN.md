@@ -123,3 +123,40 @@ state (>90% hits) runs almost entirely on GPU.
 41 tg (ncmoe 22, clean box). **Hit rate is necessary but not sufficient** - the moe-cache
 regression proves a high-hit-rate cache can still lose to sync overhead. Measure tg at each
 gate; never project it from hit rate.
+
+## Review (Fable, 2026-07-08) — approved with four findings; address before phase 1
+
+1. **The VRAM table understates the constraint: slots do not fit at ncmoe 22.** At ncmoe 22
+   the static split leaves ~3 GB free — not even the 24-slot config (6.3 GB) fits. The cache
+   necessarily runs at higher ncmoe (~26-28), which means the honest evaluation is
+   **equal-VRAM**: N GB spent on dynamic slots vs the same N GB spent on static expert
+   layers, both measured in tg. Make this the explicit phase-2 success criterion (sim
+   arithmetic favors slots — 6 GB = 4 static layers (18% of CPU work removed,
+   deterministic) vs 24 slots/layer across all CPU layers at 74-88% hit — but it must be
+   measured, and it reframes "beat 41 tg" as "beat the best static config at the same
+   memory").
+2. **Phase-1 gate is too strict and could kill a healthy design.** Synchronous promotion
+   costs ~4-8 misses/token x 12 MB of blocking H2D early on; phase 1 can easily sit below
+   41 tg while the architecture is sound. Split the gate: phase 1 = correctness
+   (temp-0 byte-identical) + online hit rate matching the sim ±5% + tg above a sanity floor
+   (~35); the ≥41/equal-VRAM bar belongs to phase 2.
+3. **Promotion path has a hidden dependency on pinned staging (item 12's machinery).**
+   Misses promote via cudaMemcpyAsync from mmap'd host weights — but shard 3's experts are
+   unpinned (36 GB WDDM cap), so those promotions are pageable copies (~2-3 GB/s, serializing
+   the copy stream) and the copy must respect the one-registered-region rule (the
+   copy-straddle landmine). Phase 2 should bounce promotions through a small pinned staging
+   ring (2x16 MB suffices at ~12 MB/expert). That is item 12's mechanism at smaller scale —
+   build it inside the cache first; it de-risks the standalone item 12 later. Supervised
+   session for this piece.
+4. **Open questions, answered where the code already decides them:** (a) two mul_mat_id
+   calls per layer is the right phase-1 shape — ids are already read to host on this path, so
+   the hit/miss split and slot-id remap are host-side array ops; the combine happens on GPU
+   where the weighted sum already lives, and the CPU-miss branch's activation round-trip is
+   the status quo for ncmoe layers, not a new sync. (b) three separate slot buffers
+   (gate/up/down), one per _exps tensor — mul_mat_id consumes per-matrix expert tensors, so
+   a triple-packed buffer would need a custom stride. (c) copy-stream contention at decode is
+   a non-issue (no prefill uploads in flight); measure anyway at phase 2 via nsys.
+   (d) skip the autotune until phase 2 ships; hand-tuned slots-per-free-VRAM is fine for the
+   experiment.
+
+Green light for phase 0 and phase 1 unattended; phase 2 supervised (finding 3).
