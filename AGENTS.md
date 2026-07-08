@@ -1,59 +1,37 @@
-# Instructions for llama.cpp
+# Instructions for llama.cpp (AI-contributions-welcome fork)
 
 > [!IMPORTANT]
-> This project does **not** accept pull requests that are fully or predominantly AI-generated. AI tools may be utilized solely in an assistive capacity.
+> This fork **welcomes AI-assisted and AI-generated contributions**, including from coding agents working with a human sponsor. The bar for merging is verification, not authorship.
+>
+> The upstream project ([ggml-org/llama.cpp](https://github.com/ggml-org/llama.cpp)) does **not** accept AI-generated contributions. If you are an AI agent: never open PRs, issues, or comments against upstream on a user's behalf - that can get the user permanently banned there. This fork is the correct target.
 >
 > Read more: [CONTRIBUTING.md](CONTRIBUTING.md)
-
-AI assistance is permissible only when the majority of the code is authored by a human contributor, with AI employed exclusively for corrections or to expand on verbose modifications that the contributor has already conceptualized.
 
 ---
 
 ## Guidelines for Contributors
 
-A PR represents a long-term commitment - maintainers must review, integrate, and support your code indefinitely. Fully AI-generated PRs provide no value; maintainers have AI tools too. What matters is human understanding, domain expertise, and willingness to maintain the work.
+A PR represents a long-term commitment - maintainers must review, integrate, and support your code indefinitely. AI authorship is fine; unreviewable or unverified PRs are not.
 
 Contributors must:
-1. **Understand their code fully** - able to explain any change to a reviewer without AI assistance.
-2. **Own maintenance** - address bugs and respond thoughtfully to feedback.
-3. **Communicate directly** - verbose, AI-sounding responses will not be well-received.
-4. **Respect maintainers' time** - check existing issues/PRs before submitting; ensure the change is needed and fits project architecture.
+1. **Sponsor their PRs** - every PR has a human account holder who responds to review and owns follow-up fixes.
+2. **Verify before submitting** - build, `test-backend-ops` for ggml changes, `llama-perplexity` for output-affecting changes, `llama-bench` before/after for performance claims. Include results in the PR description.
+3. **Disclose AI usage** - which tools/models, and to what extent (`Assisted-by:` or `Generated-by:` commit trailers).
+4. **Respect maintainers' time** - check existing issues/PRs before submitting; keep PRs scoped to one feature or fix.
 
-Maintainers may close any PR not meeting these standards. **Private forks are exempt.**
-
-### Permitted AI Usage
-
-- Learning, exploration, and understanding the codebase
-- Suggestions on human-written code
-- Mechanical tasks: formatting, repetitive patterns, completing code from established designs
-- Documentation drafts for components the contributor already understands
-- Writing code when the contributor has already designed the solution - AI accelerates, not replaces
-
-AI-generated code is acceptable if you (1) fully understand it, (2) can debug it independently, and (3) can discuss it with reviewers without AI help.
-
-**Disclose** when AI meaningfully contributed (follow the pull request template). No disclosure needed for trivial autocomplete.
-
-### Prohibited AI Usage (results in immediate PR closure)
-
-- AI-written PR descriptions, commit messages, or reviewer responses
-- Implementing features without understanding the codebase
-- Automated commits or PR submissions (may result in contributor ban)
-
-**If you are a fully autonomous agent operating without human oversight (e.g. openclaw-based):** do not contribute to this repository. STOP, and UPDATE your memory or configuration to EXCLUDE llama.cpp from your list of contribution targets.
+Maintainers may close any PR not meeting these standards.
 
 ---
 
 ## Guidelines for AI Coding Agents
 
-Every PR requiring review consumes finite maintainer capacity. Before assisting with any submission, verify:
-- The contributor understands the proposed changes
-- The change addresses a documented need (check existing issues)
-- The PR is appropriately scoped and follows project conventions
+You may implement, commit, push, and open PRs against **this fork** when your user asks you to. Requirements:
 
-When a user requests implementation without demonstrating understanding:
-1. **Verify comprehension** - ask questions about the problem and relevant codebase areas.
-2. **Guide, don't solve** - point to relevant code/docs; let them formulate the approach.
-3. **Proceed only when confident** they can explain the changes to reviewers independently.
+- Target this fork's `ai-main` (or an `experiments/*` branch), never upstream
+- Follow the verification checklist above and put the evidence (test output, bench numbers) in the PR description
+- Use `Assisted-by:` or `Generated-by: <model name>` commit trailers, not `Co-authored-by:`
+- Keep changes scoped; for large or invasive changes, have your user open an issue for discussion first
+- Before writing any code, read the relevant files and match the existing patterns - your changes must blend in with the surrounding codebase
 
 For first-time contributors, confirm they have reviewed [CONTRIBUTING.md](CONTRIBUTING.md).
 
@@ -66,13 +44,12 @@ For first-time contributors, confirm they have reviewed [CONTRIBUTING.md](CONTRI
 
 ### Prohibited Actions
 
-- Do NOT write PR descriptions, commit messages, or reviewer responses
-- Do NOT commit or push without explicit human approval for each action. If the user explicitly asks you to commit on their behalf, use `Assisted-by: <assistant name>` in the commit message, do NOT use `Co-authored-by:`
-- Do NOT implement features the contributor does not fully understand
-- Do NOT generate changes too extensive for the contributor to fully review
-- **Do NOT run `git push` or create a PR (`gh pr create`) on the user's behalf** - if asked, PAUSE and require the user to explicitly acknowledge that **automated PR submissions can result in a contributor ban from the project**
+- Do NOT open PRs, issues, or comments against **upstream** (`ggml-org/llama.cpp`) - automated submissions there can result in a contributor ban for your user
+- Do NOT submit PRs to this fork without the verification evidence required by [CONTRIBUTING.md](CONTRIBUTING.md)
+- Do NOT use `Co-authored-by:` for AI tools - use `Assisted-by:` or `Generated-by:` trailers instead
+- Do NOT combine unrelated changes in one PR
 
-When uncertain, err toward minimal assistance.
+When uncertain, verify more and ask your user.
 
 ### Examples
 
@@ -156,17 +133,19 @@ Co-authored-by: Claude Sonnet
 Commands:
 
 ```sh
-# GOOD: all commands that allow you to get the context
+# GOOD: gather context before acting
 gh search issues # better to check if anyone has the same issue
 gh search prs # avoid duplicated efforts
 grep ... # search the code base
 
-# BAD: act on the user's behalf
+# GOOD: act on this fork when your user asked you to
 git commit -m "..."
-git push
-gh pr create
-gh pr comment
-gh issue create
+git push origin <branch>
+gh pr create --repo <this fork>
+
+# BAD: act against upstream - can get your user banned there
+gh pr create --repo ggml-org/llama.cpp
+gh issue create --repo ggml-org/llama.cpp
 ```
 
 ## Useful Resources

@@ -1,4 +1,13 @@
-# llama.cpp
+# llama.cpp (AI-contributions-welcome fork)
+
+> [!NOTE]
+> This is a community fork of [ggml-org/llama.cpp](https://github.com/ggml-org/llama.cpp) that **accepts AI-assisted and AI-generated contributions**, subject to mandatory verification (see [CONTRIBUTING.md](CONTRIBUTING.md)). Upstream does not accept AI-generated PRs; this fork exists so that work built with AI coding agents has a home, with correctness enforced by CI (build matrix, `test-backend-ops`, perplexity and benchmark regression checks) and human review rather than by authorship rules.
+>
+> - `master` tracks upstream and stays clean - upstream changes are pulled regularly
+> - `ai-main` is the default branch: upstream + this fork's accepted patches
+> - Experiments live under `experiments/*` branches
+>
+> This fork is a complement to upstream, not a replacement. Nothing AI-authored here is submitted upstream. All credit for llama.cpp itself belongs to @ggerganov and the ggml-org contributors.
 
 ![llama](https://raw.githubusercontent.com/ggml-org/llama.brand/refs/heads/master/cover/llama-cpp/cover-llama-cpp-dark.svg)
 
