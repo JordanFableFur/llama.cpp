@@ -71,8 +71,10 @@ this design:
 cannot split one `mul_mat_id` across resident/non-resident experts. Instead, at each CPU MoE
 layer during decode:
 
-1. **Slot pool (per CPU layer):** a GPU buffer holding `S` expert triples (gate/up/down) +
-   a host-side `expert_to_slot[128]` map (-1 = not resident) and an LRU recency list.
+1. **Slot pool (per CPU layer):** **three** separate GPU slot buffers (gate/up/down, one per
+   `_exps` tensor - review finding 4b; a triple-packed buffer would need a custom stride), each
+   holding `S` experts, plus a host-side `expert_to_slot[128]` map (-1 = not resident) and an
+   LRU recency list.
 2. **Split the routed top-4 into hits and misses** using `expert_to_slot`.
 3. **Hits -> GPU:** remap routed expert ids to slot ids and run `mul_mat_id` against the slot
    buffer. No sync.
@@ -95,34 +97,43 @@ state (>90% hits) runs almost entirely on GPU.
   *Gate:* online hit rate matches the offline sim within +/-5% on the same workload. If not,
   the model of reuse is wrong - stop and reconcile before building the cache.
 - **Phase 1 - synchronous slot cache, CPU layers only.** Per-layer LRU pool, hits on GPU /
-  misses on CPU, promote synchronously (simplest, correct). *Gates:* temp-0 seed-fixed output
-  byte-identical to baseline; tg >= 41 (ncmoe 22 clean baseline) - i.e. at least not a
-  regression even before async.
-- **Phase 2 - async promote (compute-now/promote-later).** Move promotion to a copy stream;
-  keep the hit path sync-free. *Gates:* tg improves over phase 1; nsys confirms promotions are
-  on the copy stream and the decode stream has no per-token host sync; p99 inter-token latency
-  not worse.
+  misses on CPU, promote synchronously (simplest, correct). *Gates (revised per review
+  finding 2 - do NOT hold phase 1 to 41 tg):* (a) temp-0 seed-fixed output byte-identical to
+  baseline; (b) online hit rate matches the offline sim within +/-5% on the same workload;
+  (c) tg above a sanity floor (~35) - synchronous ~4-8 misses/token x 12 MB blocking H2D can
+  legitimately sit below 41 while the architecture is sound. The >=41 bar is phase 2's.
+- **Phase 2 - async promote (compute-now/promote-later). SUPERVISED (review finding 3).** Move
+  promotion to a copy stream through a small **pinned staging ring** (2x16 MB; shard-3 experts
+  are unpinned -> pageable copies otherwise, and the copy must respect the one-registered-region
+  rule - this is item 12's machinery at small scale). Keep the hit path sync-free. *Gates:*
+  **equal-VRAM win (finding 1)** - N GB of dynamic slots must beat the best static config using
+  the same N GB, in tg (reframes "beat 41 tg"; slots do NOT fit at ncmoe 22, so run ncmoe ~26-28);
+  tg improves over phase 1; nsys confirms promotions are on the copy stream and the decode stream
+  has no per-token host sync; p99 inter-token latency not worse.
 - **Phase 3 (optional) - predictor prefetch.** 2-layer MLP (2511.10676) predicting next-token
   top-4 from the current hidden state, prefetch during attention. *Gate:* only if phase 2
   leaves a measured hit-rate gap and the tg gain exceeds the added complexity (headroom is only
   4-9 pts per item 1) - otherwise ship phase 2.
 
-## Open questions for review
+## Open questions - RESOLVED in review (finding 4)
 
-- Can `mul_mat_id` cleanly run twice per layer (GPU-hits subset + CPU-misses subset) and
-  combine, or is a fused custom op needed? This determines phase-1 feasibility.
-- Slot buffer layout: one buffer of `S` triples per layer, or three (gate/up/down) - which
-  matches `mul_mat_id`'s expected `_exps` tensor stride?
-- Does promoting on a copy stream contend with the existing prefetch/upload path enough to
-  matter at these transfer sizes (~12 MB/expert, a few misses/token)?
-- VRAM: fixed slots vs `ncmoe` is a joint optimization - is a small autotune (pick slots to
-  fill free VRAM after static placement) worth it?
+- Two `mul_mat_id` calls per layer (GPU-hits + CPU-misses, combined on GPU) is the phase-1
+  shape - ids are already host-read, so the split/remap are host array ops and the CPU-miss
+  activation round-trip is status quo, not a new sync. **[resolved: build this]**
+- Slot buffer layout: **three** separate buffers (gate/up/down), not a packed triple.
+  **[resolved]**
+- Copy-stream contention at decode is a non-issue (no prefill uploads in flight); measure
+  anyway at phase 2 via nsys. **[resolved: defer to phase 2]**
+- Slot/`ncmoe` autotune: skip until phase 2 ships; hand-tuned slots-per-free-VRAM is fine for
+  the experiment. **[resolved: defer]**
 
 ## Baseline to beat
 
-41 tg (ncmoe 22, clean box). **Hit rate is necessary but not sufficient** - the moe-cache
-regression proves a high-hit-rate cache can still lose to sync overhead. Measure tg at each
-gate; never project it from hit rate.
+**Equal-VRAM (review finding 1), not raw 41 tg.** Slots do not fit at ncmoe 22 (~3 GB free),
+so the cache runs at ncmoe ~26-28; the fair test is N GB of dynamic slots vs the same N GB of
+static expert layers, both in tg. (41 tg at ncmoe 22 remains the reference point.) **Hit rate
+is necessary but not sufficient** - the moe-cache regression proves a high-hit-rate cache can
+still lose to sync overhead. Measure tg at each gate; never project it from hit rate.
 
 ## Review (Fable, 2026-07-08) — approved with four findings; address before phase 1
 
