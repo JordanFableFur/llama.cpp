@@ -18,6 +18,24 @@ Green-lit: phase 0 and phase 1 unattended. Phase 2 is supervised (needs a human 
 >   runs to files, no benching during builds) and AGENTS.md commit standards
 >   (Generated-by: trailer, experiments/* branches, never touch master/upstream).
 
-## Status
-- See the "Phase 0" section appended below once it is run; if present, start the next run at
-  phase 1.
+## Status (updated 2026-07-08)
+
+- **Phase 0: DONE, gate PASSED.** In-engine `GGML_MOE_CACHE_SIM` counter on branch
+  `experiments/slot-cache` reproduces `simulate-cache.py` exactly (online == offline at all
+  slot budgets). See SLOT-CACHE-DESIGN.md "Phase status".
+- **Phase 1: re-scoped, NOT started.** Reading the code showed phase 1 is bigger than assumed:
+  the hit/miss split hits a static-graph wall (needs a custom on-device op, not two static
+  mul_mat_ids), and the moe-cache branch is on an incompatible ancient base (not reusable).
+  Phase 1 is greenfield CUDA. See SLOT-CACHE-DESIGN.md "Phase 1 - re-scoped" for the exact
+  interception point and the custom-op vs host-sync options.
+
+**Revised prompt for the phase-1 run** (branch `experiments/slot-cache` already exists with
+phase 0):
+
+> Read SLOT-CACHE-DESIGN.md (esp. "Phase status" and review finding 4). Phase 0 is done on
+> experiments/slot-cache. Implement phase 1 there: the custom on-device gather+matmul op
+> (option a), per-layer LRU slot buffers for CPU layers only, synchronous promotion. Honor the
+> phase-1 gates (temp-0 byte-identical output; online hit rate matches simulate-cache.py +/-5%;
+> tg >= ~35). Stop at phase 2. The custom-op shape is a new pattern - if a human is reachable,
+> get a design check before writing the CUDA; otherwise prototype the op behind an env flag and
+> keep the default path untouched.

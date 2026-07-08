@@ -171,3 +171,42 @@ still lose to sync overhead. Measure tg at each gate; never project it from hit 
    experiment.
 
 Green light for phase 0 and phase 1 unattended; phase 2 supervised (finding 3).
+
+## Phase status (2026-07-08, continued Opus run)
+
+### Phase 0 - DONE, gate PASSED.
+In-engine per-layer LRU counter `GGML_MOE_CACHE_SIM=S1,S2,...` added to `common/moe-trace.cpp`
+(branch `experiments/slot-cache`, reuses the routing-trace hook's ids read; reports hit% per
+slot budget at process exit). Validated on a 6.1K-token wikitext decode: online == offline
+(`simulate-cache.py`) **exactly** at every budget - 8/16/24/32/48/64 slots -> 43.6 / 63.3 /
+74.5 / 82.3 / 91.9 / 96.5 % on both, 36 layers, 883,152 requests. The offline reuse model is
+faithful in-engine; cleared to build the cache. Logs: `bench-results/p0-run2.log`.
+
+### Phase 1 - NOT STARTED; re-scoped after reading the code (bigger than the plan assumed).
+Two findings from `src/llama-graph.cpp` `build_moe_ffn` and the moe-cache branch change the
+phase-1 estimate. Surface to the human before committing a run to it:
+
+1. **Static-graph obstacle (the crux).** Expert compute is a single `ggml_mul_mat_id` per
+   tensor over the *full* expert weight, indexed by `selected_experts`
+   (`build_lora_mm_id(gate_exps, cur, selected_experts, ...)`, ~line 1988; same for up/down).
+   The hit/miss split depends on `selected_experts` *values*, which do not exist at graph-build
+   time (ggml builds the graph before execution). So the design's "two mul_mat_ids (hits over
+   slots + misses over CPU)" cannot be expressed as a static graph. Two ways out:
+   - **(a) Custom ggml/CUDA op** that, at compute time (ids already on-device), gathers each
+     routed expert's rows from its GPU slot if resident else from the CPU-mapped weight, then
+     matmuls. Keeps the hot path on-device (no per-token host sync) - the *right* design, but a
+     new CUDA op (substantial).
+   - **(b) Host-sync dispatch:** read `selected_experts` to host per layer, partition, dispatch
+     per-layer ops. Simple but ~36 host syncs/token - the exact moe-cache failure mode. Only
+     useful as a throwaway correctness oracle, not the shippable path.
+2. **The moe-cache branch is NOT reusable.** It sits on an ancient base (`git diff ai-main
+   experiments/moe-cache`: 627 files, +35K/-107K lines). Porting it forward is larger than
+   reimplementing against current `build_moe_ffn`. **Treat phase 1 as greenfield on current
+   ai-main**, not "adapt moe-cache scaffolding."
+
+**Revised phase-1 scope:** a focused custom-op implementation (option a) + per-layer LRU slot
+buffers (3 per CPU layer) + synchronous promotion, behind the phase-1 gates (byte-identical
+output, online hit rate matches sim +/-5%, tg >= ~35 floor). This is a dedicated,
+verification-heavy CUDA effort - appropriate for a run scoped *only* to phase 1, and arguably
+worth a human design check on the custom-op shape first (it is a new pattern per AGENTS.md).
+Not attempted unattended-and-unverified in this session.
