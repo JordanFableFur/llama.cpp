@@ -280,3 +280,21 @@ slot cache persists across tokens, so it needs a persistent home threaded into t
   contained; slightly hacky). Blocks all code.
 - D2 (miss compute): a new CPU mask-skip op is REQUIRED for a real tg win (reusing the full CPU
   matmul and subtracting hits saves no DDR5 bandwidth). Confirmed necessary, not optional.
+
+### M1 DONE (2026-07-08). Plumbing landed + verified on `experiments/slot-cache` (d929a7607).
+Design locked (owner's call): `llama_moe_slot_cache` owned by `llama_context` (KV-cache pattern,
+per-session state), reached from `build_moe_ffn` via `llm_graph_params.moe_cache` (null ->
+today's graph = off-switch). Env: `GGML_MOE_SLOT_CACHE=<slots/layer>`. Verified: compiles;
+no env -> inert (byte-normal output); =32 -> cache created (enable line fires under `-v`),
+output still correct. M1 is a no-op cache (plumbing only).
+
+**M2 plan (next):** on the first `build_moe_ffn` call for each CPU-resident layer (residency =
+`ggml_backend_buffer_is_host(gate_exps->buffer)`), register the layer's expert-tensor metadata
+(shapes, MXFP4 type, per-expert byte stride = `nb[2]`). Lazily (KV-cache style) allocate the
+cache's own `ggml_context` + a CUDA backend buffer sized `3 tensors x n_cpu_layers x (S+1) x
+per-expert-bytes`; slot `S` per tensor is a zeroed dummy (miss sink). Promotion = copy expert
+`e`'s contiguous slice (`src->data + e*nb[2]`, length `nb[2]`) into slot `s` via
+`ggml_backend_tensor_set(slot_tensor, src, s*nb[2], nb[2])` (synchronous for phase 1). Host-side
+`expert_to_slot[128]` mirror + LRU per layer, updated after decode. Gate on: buffer alloc
+succeeds within VRAM budget (log MiB), and a promoted slot's bytes match the source (memcmp a
+sample). Then M3 (CPU mask-skip op), M4 (oracle), M5 (get_rows wiring), M6 (gates+bench).
