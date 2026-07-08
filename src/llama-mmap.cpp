@@ -171,7 +171,12 @@ struct llama_file::impl {
     }
 
     bool has_direct_io() const {
-        return true;
+        // Windows has no real direct-I/O path here: the ctor opens a buffered
+        // FILE* and read_raw() always goes through ReadFile with OS caching.
+        // Advertising direct-I/O made the loader set an alignment and skip
+        // mmap for a capability that does not exist. Report the truth until a
+        // FILE_FLAG_NO_BUFFERING + OVERLAPPED loader lands.
+        return false;
     }
 
     ~impl() {
