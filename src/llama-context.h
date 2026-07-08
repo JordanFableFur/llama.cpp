@@ -4,6 +4,7 @@
 #include "llama-ext.h"
 #include "llama-cparams.h"
 #include "llama-graph.h"
+#include "llama-moe-slot-cache.h"
 #include "llama-adapter.h"
 #include "llama-impl.h"
 #include "llama-memory.h"
@@ -281,6 +282,9 @@ private:
     llama_adapter_loras_ptr loras;
 
     llama_cross cross; // TODO: tmp for handling cross-attention - need something better probably
+
+    // env-gated persistent GPU expert slot cache (GGML_MOE_SLOT_CACHE); null when disabled
+    std::unique_ptr<llama_moe_slot_cache> moe_cache;
 
     llama_memory_ptr memory;
 
