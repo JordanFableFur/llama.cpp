@@ -203,6 +203,25 @@ chat (52.0K tok, 4 merged generations):
     - This same data *strengthens* item 15 (dynamic slot cache): high per-layer skew (Gini 0.72) + per-workload variation is exactly what a cache exploits — it holds whichever experts are hot *now* instead of betting on a static set. What REAP can't do statically, a slot cache does dynamically. **Pivot Tier 3 effort to #15.**
     - (Reusable tooling: `analyze-routing-skew.py`, imatrix built in build-main. Note: clean calibration text needed for any real PPL baseline — our wikitext dump has `<unk>`/`@-@` artifacts → PPL 321, unusable.)
 
+17. **Resident-experts self-speculation (Jordan's idea, 2026-07-08).** Draft = the same model
+    with routing restricted to VRAM-resident experts (slot cache + static layers); missing
+    experts substituted by best-resident (or dropped, weights renormalized). Verify = full model
+    (CPU experts) every K tokens in ONE batched pass — amortizes the per-token ~1.2 GB DDR5
+    expert reads across K tokens. Synergy with item 15: ~92% cache hit rate means the draft
+    deviates on only ~8% of expert selections → acceptance plausibly high; measured temporal
+    locality means a K-token verify batch touches far fewer than K×4 unique experts/layer.
+    **Offline gates BEFORE any implementation (computable from existing bench-results/*.trace +
+    model, no GPU):**
+    (a) unique-experts-per-K-token-window per layer from the traces → the amortization factor;
+    (b) draft-vs-true token agreement under resident-only routing (teacher-forced,
+        substitute-and-compare) → acceptance rate; proceed only if projected speedup
+        K·accept/(K·draft_cost + verify_cost) beats phase-2 slot cache alone by >25%;
+    (c) novelty check: SP-MoE (2510.10302) / MoE-SpeQ (2511.14102) couple a SEPARATE draft
+        model with expert prefetch — verify the self-draft-via-masked-routing formulation
+        is actually new before claiming it.
+    Sequenced AFTER item 15 phases 0-2 (the cache is what makes the draft accurate). Heaviest
+    engineering item on the board (masked routing + rollback in the decode graph).
+
 Parked / rejected:
 - Chunked host registration — crashes (copy-straddle), see above.
 - Upload-only-routed-experts at prefill — worthless at ub≥512 (P(expert unused) ≈ e^-16).
