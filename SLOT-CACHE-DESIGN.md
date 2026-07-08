@@ -373,3 +373,29 @@ throwaway path:
 - **M6 (statistical gates):** real promotion -> token-agreement + ppl-within-noise vs baseline,
   online hit rate matches the Phase-0 sim (GGML_MOE_CACHE_SIM), tg >= ~35 floor.
 Build order: M5b first (de-risks the slot primitive), then M5 wiring, then M6.
+
+### M5b + M5 DONE (2026-07-08), verified on `experiments/slot-cache` (85058a0df, 1a3a3c2a0).
+- M5b unit oracle (tests/test-slot-matmul.cpp, CUDA): hit rows byte-identical (max abs diff
+  0.000e+00), miss rows zero. Slot compute/remap/offset correct.
+- M5 whole-graph: forced-empty cache -> BYTE-IDENTICAL to baseline (48 tokens). Full (c) wiring
+  correct (get_rows remap, dummy-slot zero, skip plumbing, combine). Off-switch == on-empty.
+
+### M6 PLAN + design decision (routing capture). Real promotion + statistical gates.
+The dynamic layer: per token, update per-layer LRU from the routed experts, promote misses
+(sync copy expert->slot, evict LRU), upload e2s + skip for the next token. Token t's misses are
+computed on CPU at t (skip=0 for them) and promoted for t+1 (compute-now/promote-later, sync).
+
+**Design decision - how to get the routed expert ids to host for the LRU/promotion update:**
+- **(A) graph cpy-sink [recommended]:** build_moe_ffn adds `cpy(selected_experts -> per-layer
+  persistent CPU tensor)` as a graph output; llama_context reads it post-decode and updates the
+  cache. No cb_eval conflict (the trace/counter hook owns cb_eval); tiny (neu*nt ints/layer).
+  Cost: ~36 cross-backend cpys + a post-decode read/layer - i.e. per-token sync, the moe-cache
+  failure mode for tg. Phase 1 accepts this (async promotion is phase 2); phase-1 tg gate is a
+  >=35 FLOOR, not "tg improves".
+- **(B) eval-callback:** capture ffn_moe_topk during eval like GGML_MOE_TRACE. Conflicts with the
+  trace/counter (one cb_eval) and fires mid-eval (awkward to drive promotion). Rejected.
+
+**M6 gates:** (1) token-agreement + ppl-within-noise vs baseline (GPU-computed hits vs CPU
+baseline differ in the last bits, so ppl-within-noise is the robust gate, token-agreement the
+sanity check); (2) actual cache hit rate matches the Phase-0 GGML_MOE_CACHE_SIM LRU curve for the
+same S/workload (same LRU policy -> must agree); (3) tg128 >= ~35 floor.
