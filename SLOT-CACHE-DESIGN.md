@@ -649,3 +649,40 @@ is the cpy-sink, which is fixable via eval-callback capture. With that fixed the
 per-CPU-layer activation DtoH for those layers - the remaining real ceiling - to beat static.
 DECISIVE NEXT MEASUREMENT: implement eval-callback routing capture (replacing the cpy-sink) and
 re-measure; if tg recovers toward baseline, phase 3 is viable; then scope the conditional graph.
+
+### Phase 2 - the capture floor (2026-07-08). Go/no-go: NO for this architecture; phase-3 prerequisite found.
+The cpy-sink was not a bad implementation of a good idea - per-token routing EXTRACTION is itself the
+cost, and no placement escapes it.
+
+**Capture-mechanism A/B (ncmoe36, tg128 S=8, baseline 18.4):**
+| mechanism | tg | note |
+|---|---|---|
+| NOBOOK (no capture) | 18.4 | = baseline (capture is the only cost) |
+| cpy-sink (cross-backend cpy -> CPU) | 3.7 | 36 graph splits |
+| callback (eval-callback observe) | 5.0 | disables the sched fast path |
+| GPU-sink (GPU->GPU cpy + 1 D2H) | 5.2 | dead-end output nodes; best, still ~4x down |
+
+**Isolation (GPU-sink build):** NOBOOK 18.4 / NOPROMO (capture, no update) 5.47 / full 5.04. The floor
+is the CAPTURE, not the update (update adds ~0.4 tg). Capture correctness confirmed: hit rate 66.5%
+matches across all mechanisms (the capture-bug canary).
+
+**Why:** extracting selected_experts per token forces it to be materialized as an extra graph output
+(or observed via a callback that disables the fast path) 36x/token, which breaks the pipelining/graph
+reuse the baseline relies on. The cpy-sink (approved (A) at M6) was blamed on callback-conflict grounds;
+nobody priced that 36 extraction points = 36 materialization/sync points. Review caught the cost only
+after paying it - a real lesson about what design review misses and measurement does not.
+
+**GO/NO-GO: NO for the current architecture.** No capture mechanism recovers to baseline, so the cache
+cannot beat the static champion (29.7 tg, warm-clock corrected) at ncmoe36. Two-path compute, combine,
+promotion, allocation, and the slot kernel are all FREE (measured); routing capture is the whole cost.
+
+**Phase-3 prerequisite (the real design input):** the CPU op `mul_mat_id_skip` ALREADY has
+selected_experts materialized on host (the scheduler copies it so the CPU op can run - that read is
+free). Capture must REUSE that, e.g. the op writes the routed ids to a cache buffer as a side effect,
+instead of a separate extraction node/callback. Fuse capture into existing work; do not add work to
+extract what is already there. Until capture is free, phase 3 is not viable - and this is now measured,
+not assumed.
+
+**Also credited (traces keep paying):** full-residency 76-88% at S=48 beats the 72% independence
+estimate (within-layer routing correlation); champion corrected 41 -> 29.7 tg (warm-clock -p 2048 vs
+-p 0), another measurement-conditions artifact caught by reconciling drift.
