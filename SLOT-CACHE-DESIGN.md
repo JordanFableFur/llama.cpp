@@ -686,3 +686,44 @@ not assumed.
 **Also credited (traces keep paying):** full-residency 76-88% at S=48 beats the 72% independence
 estimate (within-layer routing correlation); champion corrected 41 -> 29.7 tg (warm-clock -p 2048 vs
 -p 0), another measurement-conditions artifact caught by reconciling drift.
+
+## Phase 3 scope (Fable, 2026-07-08) — fused capture, then conditional elision
+
+The phase-2 verdict killed extraction-based capture, not the cache. Phase 3 is two measured
+steps, each gated, built on the verified-free assets (skip op, slot buffers, get_rows
+indirection, event_query, ring, all unit oracles).
+
+**P3.0 — fused capture (prerequisite, contained).** mul_mat_id_skip's CPU forward already holds
+selected_experts in host memory as a paid-for src (proven baseline-cost by NOBOOK). Have the op
+write the ids to a cache-owned host side-buffer during forward — no graph node, no callback, no
+extra materialization, no new sync. Threading note: op instances write disjoint per-layer slots;
+token boundary reads after graph completion — race-free by construction, but assert layer-slot
+disjointness in debug. *Gates:* (a) full correctness chain re-run (ppl-exact, forced-empty,
+unit oracles, hit-rate-matches-sim — the ppl chain was NOT run on the dead capture mechanisms,
+so it is owed here); (b) tg ≈ NOBOOK within 5% at ncmoe36 S=8 AND S=48 (capture is free or this
+scope stops).
+
+**P3.1 — conditional elision (the payoff).** Per-token graph construction chooses each CPU
+layer's path from the residency map published at the last token boundary: fully-resident layer
+→ GPU-only (slot mul_mat_id via get_rows; NO CPU op, NO activation DtoH/HtoD round-trip);
+any-miss layer → the existing two-path. llama.cpp already rebuilds the graph per ubatch, so
+per-token topology is legal; the known cost is loss of graph *reuse*. *Measure first:* the
+reuse-loss overhead alone (toggle topology every token with no cache, diff vs stable topology)
+— if reuse loss exceeds the round-trip savings this design is dead before implementation.
+*Then gates:* (a) nsys shows zero CPU op and zero activation round-trip on fully-resident
+layers; (b) correctness chain again (elision is a correctness-critical graph change — a layer
+elided while a routed expert is non-resident must be impossible by construction: elide only
+from the boundary-published map, never mid-token state); (c) tg > NOBOOK baseline.
+
+**P3.2 — the verdict.** Equal-VRAM vs the corrected static champion (29.7 tg, ncmoe 22, pinned,
+cold-clock protocol). Cache config: ncmoe 36 + S=48 (~28 GB) is already VRAM-matched to the
+champion (~29 GB). Ship bar: **beat 29.7 by ≥10% (≥32.7 tg)** with p99 inter-token latency not
+worse and warmup reported. Rough ceiling from measured terms (stated, not promised): baseline
+18.4 at ncmoe36 pays 36 round-trips; 76-88% of layers fully resident at S=48 → elision removes
+most of that cost → mid-30s plausible IF round-trips dominate the ncmoe36/ncmoe22 gap; P3.1's
+reuse-loss measurement is the term that decides it.
+
+**Stop conditions:** P3.0 gate (b) fails → capture is fundamentally expensive even fused; park
+the cache, publish the observer-effect finding. P3.1 reuse-loss measurement exceeds projected
+elision savings → park before implementation. Any correctness gate fails → stop per standing
+condition 3.
