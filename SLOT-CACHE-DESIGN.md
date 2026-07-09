@@ -399,3 +399,35 @@ computed on CPU at t (skip=0 for them) and promoted for t+1 (compute-now/promote
 baseline differ in the last bits, so ppl-within-noise is the robust gate, token-agreement the
 sanity check); (2) actual cache hit rate matches the Phase-0 GGML_MOE_CACHE_SIM LRU curve for the
 same S/workload (same LRU policy -> must agree); (3) tg128 >= ~35 floor.
+
+### M6 DONE - PHASE 1 COMPLETE (2026-07-08), verified on `experiments/slot-cache` (d5649f3d3).
+Dynamic per-token LRU promotion (option-A cpy-sink capture -> update_after_decode -> sync promote
++ map upload).
+
+**Correctness gates - ALL PASS (exact):**
+- ppl-within-noise: PPL **458.9669 OFF == 458.9669 ON** (byte-identical over 11 chunks). The
+  MXFP4 GPU-slot + CPU-skip combine is numerically exact vs the all-CPU baseline.
+- hit-rate matches Phase-0 sim: actual **43.6% == sim 43.6%** (S=8, identical 883152 requests).
+- token-agreement: 100% identical (temp0, 64 tokens, real promotion).
+
+**Performance floor - BELOW 35, as anticipated. Not a correctness failure; the phase-2 mandate.**
+
+| tg128 (ncmoe36 fa1) | OFF | S=8 (43.6% hit) | S=32 (90.4% hit) |
+|---|---|---|---|
+| t/s | 19.40 | 3.49 | 1.47 |
+
+perplexity/pass: OFF 68.6s, S=8 ON 279s (~4x). **More slots is worse** - the cost is the
+synchronous machinery (blocking cudaMemcpy promotion + per-layer e2s/skip uploads + 36 cpy-sink
+cross-backend syncs/token), and larger S churns more promotion during warmup. This quantifies,
+on this exact design, the moe-cache post-mortem's failure mode.
+
+**Verdict:** the slot cache is CORRECT (ppl byte-identical, hit rate exact - the whole mechanism
+works end to end) but synchronous promotion makes it 5-13x slower than baseline. This is the
+measured justification for **phase 2 (SUPERVISED): async promote on a copy stream + pinned staging
+ring (review finding 3), and the equal-VRAM comparison (finding 1)**. Phase 1 delivered a correct,
+gated foundation; phase 2 is where it earns its tg. Do NOT ship phase 1 as a tg win.
+
+**Reusable, verified assets from phase 1:** ggml_mul_mat_id_skip (+CUDA guard), the slot-buffer /
+promotion / get_rows-indirection primitives (tests/test-slot-matmul.cpp, test-mul-mat-id-skip.cpp),
+GGML_MOE_SLOT_CACHE end-to-end, GGML_MOE_CACHE_SIM. Phase 2 swaps the promotion path from sync to
+async; the compute/wiring/gates all carry forward.
