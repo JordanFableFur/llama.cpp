@@ -838,3 +838,51 @@ loss does NOT exceed projected elision savings → GO** (amendment stop conditio
 **Both pre-measurements GO.** The two unknowns in the amendment's cost model are now bounded:
 elided capture is free (3a), reuse tax is negligible (3b). Neither stop condition fires. Awaiting
 review before any P3.1 implementation.
+
+### P3.1 mispredict analysis — GATE FAILED (2026-07-09, overnight). STOP: binary dispatch is not viable. Not built.
+Jordan's overnight decision made speculative elision conditional on an offline mispredict analysis
+BEFORE any implementation, with a hard gate: *stop if mean dropped weight-mass > ~1% OR the
+top-expert-escape rate isn't rare.* Tooling: `GGML_MOE_TRACEW` weighted routing trace (ids + final
+normalized router weights) + `analyze-mispredict.py` (per-token LRU, `experiments/slot-cache`
+ae7b42c0d). Artifact: `bench-results/p31-mispredict-analysis.txt`.
+
+An elided (GPU-only) layer takes an **escape** when this token routes to an expert the boundary map
+didn't have resident; that expert's contribution is dropped (zero-fill) or renormalized away. The
+weighted trace prices the damage.
+
+| S=48 (ship target) | WIKI (ppl workload, 883,152 reqs) | CHAT (best case, lowest churn) | gate |
+|---|---|---|---|
+| per-layer escape \| elided | 24.74% | 5.71% | — |
+| per-token escape (any layer) | **99.49%** | 29.20% | — |
+| **mean dropped weight-mass** | **7.20%** | **1.67%** | **>1% → FAIL both** |
+| **top-1-expert escape rate** | **21.0%** | **19.4%** | **not rare → FAIL both** |
+
+Cross-validated: wiki per-layer escape 24.74% == the doc's own full-residency 75.7% complement; the
+trace is the exact 883,152-request wiki workload; captured weights sum to 1.000.
+
+**Why it fails, structurally:** 76% full-residency is a *per-layer* figure; across 36 layers it
+compounds to ~100% per-token escape (wiki). The top-expert-escape rate (~19–21%) is
+**domain-invariant** — an escape lands on the highest-weight expert ~1 in 5 times regardless of
+workload, so renormalization cannot rescue it (renorm only helps when dropped experts are low-mass;
+here they routinely carry 0.3–0.5 weight, mean escaped rank ~1.8 of 4). Even S=64 (2.97% dropped,
+18% top-1, and it exceeds the VRAM budget) fails the gate. **Both gate criteria fail in the
+best-case domain**, so the failure is not wiki-specific.
+
+**Both of the amendment's escape routes are closed by the same numbers:**
+- *Speculative + renorm (the chosen design):* mean dropped mass 7.2% (wiki) / 1.67% (chat), top-1
+  escape ~20% → quality perturbation on ~every token, far outside ppl-within-noise.
+- *Capture-then-replay (the priced fallback):* cost = elided + P(escape)·plain. P(escape) = 99.5%
+  (wiki) → replay ~always → strictly **worse than plain**. Viable only on low-churn chat-average
+  (29%), but its high-churn decile spikes to 94% and it still fails the dropped-mass gate. Jordan's
+  "if per-token escape is low" condition is not met on the workloads that matter.
+
+**VERDICT: STOP — do not implement P3.1.** The cache's achievable residency at the VRAM budget
+(76% per-layer at S=48) is fundamentally too low for token-level elision to be either exact-cheap
+(replay ~always) or speculatively-acceptable (drops a top expert on ~every token). Exact per-layer
+miss handling = the two-path = the split P3.0 proved slow. So the slot cache cannot beat the static
+champion by any elision route, confirming and completing the phase-2 NO at the design level.
+
+**Publishable results stand (the campaign's actual yield):** (1) the observer-effect / two-path
+misattribution finding (P3.0 NOCAP); (2) free fused + free GPU-sink capture once off the two-path
+(P3.0, 3a); (3) this per-token-escape compounding law that kills elision at realistic MoE residency.
+Nothing written to BENCHMARKS.md / TECH-REPORT.md — awaiting Jordan's review.
