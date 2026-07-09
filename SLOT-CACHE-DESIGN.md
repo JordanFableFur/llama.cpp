@@ -469,3 +469,22 @@ before writing code:
 7. **Pause points for the supervised run:** (i) after the staging ring + its unit test, before
    wiring into promotion; (ii) after first nsys trace, before the full bench matrix; (iii) final
    numbers before any BENCHMARKS.md/README claim.
+
+### Phase 2 progress. Pause (i): staging ring DONE + unit-tested (experiments/slot-cache d0ba557e1).
+Ring mechanism proven standalone (tests/test-slot-ring.cpp): host memcpy -> pinned 2x16 MiB
+double-buffer (ggml_backend_dev_host_buffer_type) -> tensor_set_async on a dedicated copy backend
+(ggml_backend_dev_init(dev) = separate stream) -> GPU slot, event-gated double-buffering. 6 experts,
+0 byte-mismatches, both buffers cycled. Wiring architecture = mirror the model loader's async-upload
+path (llama-model-loader.cpp:1483-1640), all portable via the registry.
+
+**DECISION NEEDED before wiring (pause i): the non-blocking completion check.** ggml has
+tensor_set_async, pinned buffers, a separate-stream backend, and blocking event_synchronize -
+but NO non-blocking event query. The spec's token-boundary poll (point 1) wants cudaEventQuery.
+- (A) Add `ggml_backend_event_query(event) -> bool` (CUDA: cudaEventQuery; other backends: a
+  synchronize-based or always-true fallback). Small, general, matches the spec exactly. But a new
+  ggml core API (new-pattern; AGENTS.md pause).
+- (B) Lag-by-one-token + blocking synchronize: enqueue promotion at token t; at t+1's boundary,
+  event_synchronize (by then the ~12 MiB copy is almost always already done, so it returns
+  immediately - effectively non-blocking) then update the map. No new API, but a subtle "rarely
+  blocks" caveat if a copy overruns a token.
+Lean (A): cleaner, no caveat, and event_query is a generally useful primitive. Awaiting owner call.
