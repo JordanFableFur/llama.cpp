@@ -32,7 +32,8 @@ struct llama_moe_slot_cache {
     // phase-2 addendum). Promotions run off the decode stream; the compute map (e2s/skip) is only
     // updated once event_query confirms the copy landed. Off => promote() synchronous (phase 1).
     bool         async_promote  = false;
-    int          promote_budget = 4;     // max promotions ENQUEUED per token (knob)
+    int          ring_size      = 32;    // pinned staging buffers = max promotions in flight (knob)
+    int          promote_budget = 32;    // max promotions ENQUEUED per token, GLOBAL across layers (knob)
     ggml_backend_t copy_backend = nullptr;
 
     struct ring_slot {
@@ -43,7 +44,7 @@ struct llama_moe_slot_cache {
         // deferred map update applied when evt completes:
         int layer_idx = -1, expert = -1, slot = -1;
     };
-    ring_slot ring[2];
+    std::vector<ring_slot> ring;
 
     // one entry per CPU-resident MoE layer; GPU tensors live in the owned bufs below
     struct layer_slots {

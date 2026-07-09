@@ -23,12 +23,17 @@ std::unique_ptr<llama_moe_slot_cache> llama_moe_slot_cache::maybe_create_from_en
     }
     auto cache = std::make_unique<llama_moe_slot_cache>(s);
     cache->async_promote = getenv("GGML_MOE_SLOT_SYNC") == nullptr; // async (phase 2) default; SYNC=1 => phase 1
+    if (const char * r = getenv("GGML_MOE_SLOT_RING")) {
+        const int rr = atoi(r);
+        if (rr > 0) { cache->ring_size = rr; }
+    }
+    cache->promote_budget = cache->ring_size; // default: promote up to a full ring per token
     if (const char * b = getenv("GGML_MOE_SLOT_BUDGET")) {
         const int bb = atoi(b);
         if (bb > 0) { cache->promote_budget = bb; }
     }
-    LLAMA_LOG_INFO("%s: MoE slot cache enabled, %d slots/layer, promotion=%s, budget=%d\n",
-                   __func__, s, cache->async_promote ? "async" : "sync", cache->promote_budget);
+    LLAMA_LOG_INFO("%s: MoE slot cache enabled, %d slots/layer, promotion=%s, ring=%d, budget/token=%d\n",
+                   __func__, s, cache->async_promote ? "async" : "sync", cache->ring_size, cache->promote_budget);
     return cache;
 }
 
@@ -46,9 +51,9 @@ llama_moe_slot_cache::~llama_moe_slot_cache() {
     if (copy_backend) {
         ggml_backend_synchronize(copy_backend);
     }
-    for (int r = 0; r < 2; ++r) {
-        if (ring[r].evt) { ggml_backend_event_free(ring[r].evt); }
-        if (ring[r].buf) { ggml_backend_buffer_free(ring[r].buf); }
+    for (auto & rs : ring) {
+        if (rs.evt) { ggml_backend_event_free(rs.evt); }
+        if (rs.buf) { ggml_backend_buffer_free(rs.buf); }
     }
     if (copy_backend) {
         ggml_backend_free(copy_backend);
@@ -182,18 +187,22 @@ void llama_moe_slot_cache::init(const llama_model & model, int n_expert_used_, i
             for (auto & ls : layers) {
                 ring_bytes = std::max(ring_bytes, ls.src_gate->nb[2] + ls.src_up->nb[2] + ls.src_down->nb[2]);
             }
-            for (int r = 0; r < 2; ++r) {
-                ring[r].buf  = ggml_backend_buft_alloc_buffer(host_buft, ring_bytes);
-                ring[r].ptr  = ring[r].buf ? ggml_backend_buffer_get_base(ring[r].buf) : nullptr;
-                ring[r].evt  = ggml_backend_event_new(dev);
-                ring[r].busy = false;
+            ring.resize(ring_size);
+            bool ok = (copy_backend != nullptr);
+            for (auto & rs : ring) {
+                rs.buf  = ggml_backend_buft_alloc_buffer(host_buft, ring_bytes);
+                rs.ptr  = rs.buf ? ggml_backend_buffer_get_base(rs.buf) : nullptr;
+                rs.evt  = ggml_backend_event_new(dev);
+                rs.busy = false;
+                if (!rs.ptr || !rs.evt) { ok = false; }
             }
-            if (!copy_backend || !ring[0].ptr || !ring[1].ptr || !ring[0].evt || !ring[1].evt) {
+            if (!ok) {
                 LLAMA_LOG_WARN("%s: async promotion setup failed; using synchronous promotion\n", __func__);
                 async_promote = false;
             } else {
-                LLAMA_LOG_INFO("%s: async promotion: dedicated copy stream + 2 x %.1f MiB pinned ring\n",
-                               __func__, ring_bytes / (1024.0 * 1024.0));
+                LLAMA_LOG_INFO("%s: async promotion: dedicated copy stream + %d x %.1f MiB pinned ring (%.0f MiB)\n",
+                               __func__, ring_size, ring_bytes / (1024.0 * 1024.0),
+                               ring_size * ring_bytes / (1024.0 * 1024.0));
             }
         }
     }
@@ -221,7 +230,7 @@ void llama_moe_slot_cache::upload_maps(layer_slots & ls) {
 
 void llama_moe_slot_cache::promote_async(int layer_idx, int expert, int slot) {
     int r = -1;
-    for (int i = 0; i < 2; ++i) { if (!ring[i].busy) { r = i; break; } }
+    for (int i = 0; i < (int) ring.size(); ++i) { if (!ring[i].busy) { r = i; break; } }
     if (r < 0) { return; }
 
     layer_slots & ls = layers[layer_idx];
@@ -241,14 +250,14 @@ void llama_moe_slot_cache::promote_async(int layer_idx, int expert, int slot) {
 }
 
 void llama_moe_slot_cache::poll_completions() {
-    for (int i = 0; i < 2; ++i) {
-        if (!ring[i].busy) { continue; }
-        if (!ggml_backend_event_query(ring[i].evt)) { continue; } // copy still in flight
-        layer_slots & ls = layers[ring[i].layer_idx];
-        ls.e2s_host[ring[i].expert]  = ring[i].slot; // now compute-resident (bytes have landed)
-        ls.skip_host[ring[i].expert] = 1;
+    for (auto & rs : ring) {
+        if (!rs.busy) { continue; }
+        if (!ggml_backend_event_query(rs.evt)) { continue; } // copy still in flight
+        layer_slots & ls = layers[rs.layer_idx];
+        ls.e2s_host[rs.expert]  = rs.slot; // now compute-resident (bytes have landed)
+        ls.skip_host[rs.expert] = 1;
         upload_maps(ls);
-        ring[i].busy = false;
+        rs.busy = false;
     }
 }
 
@@ -269,11 +278,11 @@ void llama_moe_slot_cache::update_after_decode(int n_tokens) {
         }
     };
 
+    int budget = promote_budget; // GLOBAL per-token promotion budget (FIFO across layers)
     for (int li = 0; li < (int) layers.size(); ++li) {
         layer_slots & ls = layers[li];
         const int32_t * routed = (const int32_t *) ls.routed->data; // [n_expert_used, n_ubatch]
         bool sync_dirty = false;
-        int budget = promote_budget;
         for (int t = 0; t < n_tokens; ++t) {
             for (int k = 0; k < n_expert_used; ++k) {
                 const int e = routed[k + t*n_expert_used];
@@ -298,7 +307,9 @@ void llama_moe_slot_cache::update_after_decode(int n_tokens) {
                     promotions++; sync_dirty = true;
                 } else {
                     if (budget <= 0) { continue; }
-                    if (ring[0].busy && ring[1].busy) { continue; } // no staging buffer free; promote later
+                    bool ring_free = false;
+                    for (auto & rs : ring) { if (!rs.busy) { ring_free = true; break; } }
+                    if (!ring_free) { continue; } // no staging buffer free; promote a later token
                     int slot; bool demoted = false;
                     if ((int) ls.mru.size() < n_slots) { slot = (int) ls.mru.size(); }
                     else {
