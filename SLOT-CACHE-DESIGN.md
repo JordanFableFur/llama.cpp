@@ -615,3 +615,37 @@ against these same slot buffers. That substrate is now VERIFIED clean and S-inde
 does NOT inherit a kernel pathology, and its projected win (single path, no per-layer combine, elide
 the CPU op + its activation DtoH for fully-resident layers) rests on eliminating exactly the two-path
 orchestration that carries the residual S-swing. The phase-3 doc can be written against this stack.
+
+### Phase 2 - FULL COST DECOMPOSITION (2026-07-08). The residual is the cpy-sink, and it is fixable.
+Toggle isolation (ncmoe36, tg128 r3, baseline 18.5) + full-residency sim + champion re-run.
+
+| build mode | S=8 | S=48 | isolates |
+|---|---|---|---|
+| off (baseline) | 18.5 | 18.5 | - |
+| NOBOOK (slot buffers allocated; no cpy-sink, no promotion) | 18.4 | 18.5 | allocation + VRAM = **FREE**, flat in S |
+| NOPROMO (cpy-sink ON, promotion OFF) | 4.12 | 1.02 | promotion = nearly free |
+| NOSLOT (cpy-sink + promotion, plain-CPU compute) | 3.83 | 1.03 | - |
+| twopath (cpy-sink + promotion + GPU-slot + combine) | 3.77 | 1.03 | two-path compute + combine = **FREE** |
+
+**The entire 18 -> 1 collapse is the CPY-SINK** - the 36 GPU->CPU routing-id copies (`ggml_cpy(selected_experts -> routed_cpu)`) inserted into the decode graph, one per CPU layer, which split the graph and serialize the pipeline. NOBOOK (no cpy-sink) == baseline; adding only the cpy-sink drops it to 4/1. Combine, two-path compute, promotion, and allocation are all FREE. This is an IMPLEMENTATION artifact, not a ceiling.
+
+**Fix:** capture routed ids via the eval callback (the GGML_MOE_TRACE mechanism - reads the ids tensor post-op, NO graph node, NO cross-backend copy, NO serialization) instead of a graph cpy-sink. Both phase 2 and phase 3 need this; it is the single highest-value change.
+
+**Full-residency (phase-3 conditional-elision candidates), P(all 4 routed resident):**
+| S | wiki | code | chat |
+|---|---|---|---|
+| 32 | 54.7 | 55.4 | 78.7 |
+| 48 | 75.7 | 78.8 | 87.6 |
+| 64 | 88.7 | 90.0 | 93.3 |
+(> naive hit^4 - within-layer routing is correlated, which helps phase 3.)
+
+**Static champion (pinned, -b 4096 -ub 2048, r5):** ncmoe22 29.7, 24 29.1, 26 27.1, 28 25.6 tg
+(+/-5-7). NOTE the 29.7-vs-Tier0-41 gap is GPU clock-warming (-p 0 here vs -p 2048 prefill in
+Tier 0), not a regression - control -p in the go/no-go comparison.
+
+**Reframed go/no-go (positive):** the combine phase-3 was feared to inherit is FREE. The killer
+is the cpy-sink, which is fixable via eval-callback capture. With that fixed the cache runs at
+~baseline; phase 3's conditional elision of fully-resident layers (76-88% at S=48) then removes the
+per-CPU-layer activation DtoH for those layers - the remaining real ceiling - to beat static.
+DECISIVE NEXT MEASUREMENT: implement eval-callback routing capture (replacing the cpy-sink) and
+re-measure; if tg recovers toward baseline, phase 3 is viable; then scope the conditional graph.
