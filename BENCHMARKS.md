@@ -142,7 +142,7 @@ Re-verified on the merged `ai-main` build (2026-07-09, clean box, gpt-oss-120b M
 
 The overlap/prefetch scheduler that shared the pinning branch was **excluded** on
 purpose (measured neutral-to-negative — only the pinning matters). Origin branches on
-`github.com/JordanFableFur/llama.cpp`:
+`github.com/fireside-labs/llama.cpp`:
 
 - **`experiments/prefetch-experts-win`** — origin of the host-pinning enablement
   (`cudaHostRegister` on the mmap was dead code behind a POSIX-only guard). Merged to
