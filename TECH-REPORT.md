@@ -1,6 +1,6 @@
 # Running a 120B Mixture-of-Experts Model on a Consumer Windows PC: Measurements, Dead Code, and the Anatomy of an Expert Cache
 
-**Tech report v0.1 — 2026-07-08.** Status: working draft; single model, single machine. Every
+**Tech report v0.2 — 2026-07-09.** Status: working draft; single model, single machine. Every
 number cites a raw artifact committed to this repository (`bench-results/`, branch names inline).
 Authored by AI agents (Claude Fable 5, Claude Opus 4.8) under the verification-over-authorship
 policy of this fork ([CONTRIBUTING.md](CONTRIBUTING.md)); all claims are gated on committed logs.
@@ -24,8 +24,11 @@ published claim, and 48 slots/layer (37.5% of experts) suffices for 92–96% hit
 workloads; (5) a slot cache implemented on these findings is **byte-exact correct at 92% real
 GPU hit rates but slower than no cache at all** — profiling attributes the loss not to the
 matmul (S-independent, ~18 µs), promotion machinery (async, verified overlap), or VRAM, but to
-per-layer two-path orchestration in the graph scheduler, a cost that *rises* with hit rate. We
-release the trace tooling, cache simulator, all raw logs, and the verified primitives.
+per-layer two-path orchestration in the graph scheduler, a cost that *rises* with hit rate — later
+positively isolated (§5.1: two-path alone drops tg 18.4→1.5 at S=48, capture is free) and, since
+routing escapes a fully-resident-layer prediction on ~100% of tokens at feasible VRAM budgets,
+token-level elision is killed at the design gate and the cache parked. We release the trace
+tooling, cache simulator, all raw logs, and the verified primitives.
 
 ## 1. Setup
 
@@ -130,7 +133,7 @@ sequence matters more than the headline:
 | async machinery overhead | refuted | async S8 3.85 tg > sync S8 3.49 |
 | slot-matmul kernel pathology | refuted | flat ~18 µs/op from S=8 to S=128 (microbench) |
 | token-boundary host cost | minor, inverse in S | 25→6 ms as S grows |
-| **two-path orchestration** | **residual (bounded, not yet isolated)** | non-boundary time 235→946 ms as S rises |
+| **two-path orchestration** | **isolated (§5.1, NOCAP)** | two-path alone: tg 19.15→5.59 (S8) / 18.40→1.48 (S48) |
 
 The structural component: option-(c)'s design runs *both* paths every layer (GPU slot matmul +
 CPU masked matmul) and combines per layer; a CPU-resident layer also pays its activation
@@ -143,11 +146,73 @@ community cache attempt (tg 12.0 → 10.8, 108 host syncs/token).
 
 **The honest summary: hit rate is necessary and very far from sufficient.** A cache with
 provably near-optimal residency loses 20x to static placement if the per-layer execution
-structure charges more for the split than the arithmetic it saves. Phase 3 (single-path
-per-layer dispatch — a fully-resident layer skips the CPU op and its round-trip entirely) is
-gated on a cost model whose every term is now measured, plus one pending isolation experiment;
-its go/no-go is `projected ceiling must beat the equal-VRAM static champion`, computed before
-implementation.
+structure charges more for the split than the arithmetic it saves.
+
+## 5.1 Phase 3: the two-path cost isolated, and elision killed at the design gate
+
+Phase 3 (single-path per-layer dispatch — a fully-resident layer skips the CPU op and its
+round-trip entirely) was pursued to gates only, and **stopped before implementation**. Three
+measured findings resolve §5's open item and close the design.
+
+**Finding A — the wall is the two-path structure, not routing capture (a misattribution).** §5's
+diagnosis left "two-path orchestration" as a residual bounded by elimination. Adding an
+everything-off control — `NOCAP`: the two-path graph built but capture and promotion disabled —
+isolates it positively (ncmoe36 tg128, r3):
+
+| | S=8 | S=48 | isolates |
+|---|---|---|---|
+| NOBOOK (plain path, no two-path) | 19.15 ± 3.33 | 18.40 ± 3.87 | baseline (flat in S) |
+| NOCAP (two-path built, capture+promote OFF) | 5.59 ± 0.41 | 1.48 ± 0.03 | two-path split ALONE |
+| fused (two-path + fused capture + promote) | 5.16 ± 0.31 | 1.52 ± 0.04 | + capture + promotion |
+
+The two-path structure alone collapses tg (19.15→5.59 at S=8, 18.40→1.48 at S=48); adding capture
+on top is free. The phase-2 verdict "per-token routing extraction is itself the cost" was an
+artifact: every capture mechanism in that A/B was measured on top of the two-path, which had
+already collapsed tg before any capture was added. **Process rule: an A/B over mechanisms is
+uninterpretable without the everything-off cell on the same substrate** — this pattern recurred
+three times in the campaign. Artifacts: SLOT-CACHE-DESIGN.md "P3.0 DONE"; correctness chain
+ppl-exact 458.9669 (OFF==ON==forced-empty, byte-identical, 11 chunks); hit-rate canary
+66.5%/92.4% exact vs sim.
+
+**Finding B — routing capture is free once off the two-path.** Two independent capture mechanisms
+cost nothing on the plain substrate: fused capture (`ggml_mul_mat_id_skip` optional src[4] writes
+routed ids during the matmul it already runs; free by the NOCAP decomposition), and a batched
+GPU-sink on the plain path (`...NOSLOT=1 GPUSINK=1 NOPROMO=1`: tg128 18.02 ± 4.62 ≈ NOBOOK 19.15,
+online hit rate 64.7% confirming correct ids). The phase-2 "GPU-sink 5.2 tg" was entirely
+two-path contamination. Residency tracking is not the obstacle. Artifacts: SLOT-CACHE-DESIGN.md
+"P3.1 pre-measurements DONE" 3(a).
+
+**Finding C — the per-token-escape compounding law kills token-level elision.** Binary dispatch
+elides a layer only when it is fully resident; an elided layer *escapes* when the token routes to
+a non-resident expert, dropping (renormalizing away) that expert's contribution. A weighted
+routing trace (ids + final router weights, sum=1.000 verified) prices the damage. Gate: stop if
+mean dropped weight-mass > ~1% OR the top-1-expert escape rate is not rare.
+
+| S=48 (VRAM-matched to the 29.7 tg champion) | WIKI (ppl workload) | CODE (worst) | CHAT (best) | gate |
+|---|---|---|---|---|
+| per-layer escape \| elided | 24.74% | 25.34% | 5.71% | — |
+| per-token escape (any of 36 layers) | 99.49% | 97.66% | 29.20% | — |
+| **mean dropped weight-mass** | **7.20%** | **7.34%** | **1.67%** | **>1% → FAIL all** |
+| **top-1-expert escape rate** | **21.0%** | **20.0%** | **19.4%** | **not rare → FAIL all** |
+
+76% full-residency is a *per-layer* figure; across 36 independent layers it compounds to ~100%
+per-token escape (wiki/code). The top-1-expert escape rate (~19–21%) is domain-invariant — an
+escape lands on the token's highest-weight expert ~1 in 5 times regardless of workload, and
+escaped experts carry 0.3–0.5 of the router weight (mean escaped rank ~1.8 of 4), so
+renormalization cannot rescue quality. Even S=64 (2.97% dropped) fails and exceeds the VRAM
+budget. The priced fallback (capture-then-replay: cost = elided + P(escape)·plain) is closed by
+the same numbers: P(escape) ≈ 99.5% (wiki) means replay ~always → worse than plain. Exact
+per-layer miss handling is the two-path Finding A proved slow. Artifacts:
+`bench-results/item15-p31-kill-table-3domain.txt`, `bench-results/p31-mispredict-analysis.txt`,
+`analyze-mispredict.py`, weighted traces `{wiki,code,chat}-w.tracew`.
+
+**Verdict: phase 3 stopped, item 15 parked.** The cache's achievable residency at the VRAM budget
+is fundamentally too low for token-level elision to be either exact-cheap (replay ~always) or
+speculatively acceptable (drops a top expert on ~every token). The slot cache cannot beat the
+static champion (29.7 tg) by any elision route, completing the phase-2 NO at the design level.
+What survives is reusable: the everything-off-control rule (A), free routing capture (B), and the
+per-token-escape compounding law (C) — a general bound on token-level expert elision at any MoE
+residency short of ~full.
 
 ## 6. Process notes (why the numbers are trustworthy)
 
@@ -163,10 +228,12 @@ EXPERIMENTS.md and SLOT-CACHE-DESIGN.md.
 ## 7. Limitations and next
 
 Single model (gpt-oss-120b), single machine, single OS. The trace tooling and simulator port
-directly to other MoE families (Qwen3-Next, GLM-4.x) — the first replication target. Pending:
-two-path isolation toggle + trace-derived full-residency curves (phase-3 go/no-go), pinned-flag
-champion re-run for the final table, resident-experts self-speculation (EXPERIMENTS.md item 17,
-offline-gated), page-aligned expert slab layout (item 18).
+directly to other MoE families (Qwen3-Next, GLM-4.x) — the first replication target. Resolved
+since v0.1: phase-3 go/no-go (§5.1 — two-path isolated, elision killed at the design gate, item 15
+parked); resident-experts self-speculation (EXPERIMENTS.md item 17 — offline gates STOP: projected
+speedup ≤1.14x in all three domains vs the 1.25x bar, amortization only 1.7–1.9x, novelty ADJACENT
+to SS-MoE). Pending: pinned-flag champion re-run for the final table, page-aligned expert slab
+layout (item 18).
 
 ## Artifacts
 

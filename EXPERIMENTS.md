@@ -222,6 +222,46 @@ chat (52.0K tok, 4 merged generations):
     Sequenced AFTER item 15 phases 0-2 (the cache is what makes the draft accurate). Heaviest
     engineering item on the board (masked routing + rollback in the decode graph).
 
+    ### Item 17 — OFFLINE GATES RUN 2026-07-09 → **STOP, do not implement.** `experiments/slot-cache` (444125a82).
+    All three gates run before any engine; no masked-routing/rollback graph built. Tooling committed:
+    `GGML_MOE_DRAFT_SIM` diagnostic (restricts routing to a simulated S=48 LRU resident set, renorm
+    over the present set; validated byte-identical at all-resident, ppl 458.9669 with env unset),
+    harness `llama-draftsim`, `analyze-amortization.py`, `gen-draft-masks.py`, `compare-argmax.py`,
+    `project-speedup.py`. Artifacts `bench-results/item17-gate-{a,b}-*.txt`.
+
+    - **Gate (a) — amortization factor (verify cost).** Unique experts touched per layer per K-token
+      window (batched verify streams these once instead of K×4). Weak temporal locality: even K=8
+      touches ~17–18 unique of 32 possible → amortization only **1.7–1.9×**; verify_cost(K=8) ≈
+      4.3–4.6 plain-token-times (wiki/code/chat). A K-token verify is not cheap.
+    - **Gate (b) — draft-vs-true token agreement (the decisive number).** Teacher-forced ≥2K
+      tokens/domain, greedy argmax, routing restricted to S=48 resident + renorm:
+
+      | S=48 | top-1 agreement | accept(4) | accept(6) | accept(8) |
+      |---|---|---|---|---|
+      | WIKI (ppl) | 61.8% | 1.45 | 1.64 | 1.71 |
+      | CODE (worst mass) | 89.6% | 3.17 | 4.43 | 5.53 |
+      | CHAT (best mass) | 89.4% | 3.09 | 4.22 | 5.16 |
+
+      Note agreement tracks output-token *entropy* (code/chat predictable → high) not dropped-mass —
+      why gate (b) had to be measured, not inferred from the item-15 mispredict analysis.
+    - **Projected speedup** = champion(29.7)·accept(K)/(draft_frac·K + verify_cost(K)), verify_cost
+      from gate (a), draft_frac swept 0.1–0.3 (resident-only draft), optimistic +1 verify-bonus
+      variant shown. **Max over all domains/K/assumptions = 1.14× (code K=4, +1 bonus, cheapest
+      draft); realistic cases ≤1.0×.** Ship bar **1.25×** → **FAIL in every domain.** verify_cost is
+      a lower bound (ignores fixed/attention/graph-rebuild cost), so the projection is biased toward GO
+      and still fails.
+    - **Gate (c) — novelty: ADJACENT (not novel).** Closest prior art **SS-MoE** (ACM WebConf 2026,
+      DOI 10.1145/3774904.3792218): same-model self-speculation with routing masked to a resident
+      expert subset for memory-limited MoE — pre-empts the broad mechanism. SP-MoE (2510.10302),
+      MoE-SpeQ (2511.14102), MTP PR #22673 all use a *separate* draft model / trained heads (distinct).
+      Only narrowly novel: the draft's resident set being a dynamic per-layer LRU cache fused with the
+      offload cache (vs SS-MoE's static hot-expert partition). Not enough to carry the item alone.
+
+    **Why STOP:** the memory wall the self-draft was meant to hide is not hidden — verify must still
+    stream ~unique(K) experts (gate a, only 1.7–1.9× amortized), and acceptance is too low/short
+    (gate b) to cover that cost; the one domain with high agreement (code, 89.6%) still projects
+    ≤1.14×. Independently, the mechanism is already published (gate c). All three gates say no.
+
 18. **MoE-aware GGUF layout: page-aligned expert slabs (Jordan's idea, 2026-07-08).** Offline
     repack (GGUF stays the container; this is a layout convention + loader awareness): pad every
     expert slab to a page boundary (~18 MB overhead on 59 GB) and store each expert's
