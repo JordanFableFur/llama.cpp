@@ -7,6 +7,8 @@
 > - `ai-main` is the default branch: upstream + this fork's accepted patches
 > - Experiments live under `experiments/*` branches
 >
+> **Windows performance/correctness fixes (now on `ai-main`, all verified):** host-memory pinning of mmap'd weights — **~2.2× prefill** on bigger-than-VRAM MoE offload, **opt-in** via `GGML_CUDA_REGISTER_HOST=1` (was dead code behind a POSIX-only guard); working-set release of GPU-uploaded mmap pages during generation (**~47 → ~24 GB**, output-identical); and an honest `--direct-io` capability report (was silently fake on Windows). These repair Windows-only gaps against POSIX; Linux already had all three. See [BENCHMARKS.md](BENCHMARKS.md) for the measured numbers and the best-known config.
+>
 > This fork is a complement to upstream, not a replacement. Nothing AI-authored here is submitted upstream. All credit for llama.cpp itself belongs to @ggerganov and the ggml-org contributors.
 
 ![llama](https://raw.githubusercontent.com/ggml-org/llama.brand/refs/heads/master/cover/llama-cpp/cover-llama-cpp-dark.svg)

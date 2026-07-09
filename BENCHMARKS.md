@@ -125,18 +125,31 @@ tg with its `-p` value or the number is ambiguous.
 
 The only ships from the campaign are static, zero-algorithm config/plumbing fixes
 (the [TECH-REPORT.md](TECH-REPORT.md) §6 thesis: dynamic expert management does not
-beat well-tuned static offload at a consumer VRAM budget on this model). Branches
-on `github.com/JordanFableFur/llama.cpp`:
+beat well-tuned static offload at a consumer VRAM budget on this model). **The three
+Windows fixes are now merged onto `ai-main`** (default branch) — they no longer
+require checking out an experiment branch. All three repair Windows-only gaps against
+POSIX (Linux already had working pinning, real direct-io, and proper mmap-fragment
+release), so Linux users get no code change from them.
 
-- **`experiments/prefetch-experts-win`** — Windows host pinning (the ~2.1x pp win).
-  The mmap `cudaHostRegister` path was dead code behind a POSIX-only guard; this
-  builds it on Windows. (The branch's prefetch *scheduling* is neutral-to-negative
-  and not recommended — only the pinning matters.)
-- **`experiments/win-mmap-pressure`** — release GPU-uploaded mmap pages from the
-  working set (`VirtualUnlock`); 47.2 → 24.0 GB resident during generation,
-  output-identical.
-- **`experiments/win-fast-load`** — honest `--direct-io` on Windows (was silently
-  advertised-but-unimplemented).
+Re-verified on the merged `ai-main` build (2026-07-09, clean box, gpt-oss-120b MXFP4):
+
+| fix | on ai-main | evidence (merged build) |
+|---|---|---|
+| host pinning (opt-in `GGML_CUDA_REGISTER_HOST=1`) | ✅ | pp2048 **238.4 → 534.0 = 2.24x** (ncmoe 24, ub 512, fa1, r=5) |
+| working-set release (`VirtualUnlock`, always on) | ✅ | peak WS during generation **25.6 GB** (vs documented 47.2 GB pre-fix) |
+| honest `--direct-io` (Windows reports false) | ✅ | default-off path; ppl **458.9669** unchanged |
+| off-switch (all env gates off) | ✅ | ppl **458.9669**, byte-identical to pre-merge ai-main |
+
+The overlap/prefetch scheduler that shared the pinning branch was **excluded** on
+purpose (measured neutral-to-negative — only the pinning matters). Origin branches on
+`github.com/JordanFableFur/llama.cpp`:
+
+- **`experiments/prefetch-experts-win`** — origin of the host-pinning enablement
+  (`cudaHostRegister` on the mmap was dead code behind a POSIX-only guard). Merged to
+  ai-main *without* its prefetch-scheduling commits.
+- **`experiments/win-mmap-pressure`** — origin of the `VirtualUnlock` working-set
+  release; 47.2 → 24.0 GB during generation, output-identical.
+- **`experiments/win-fast-load`** — origin of the honest `--direct-io` report.
 - **`experiments/routing-trace`** — env-gated per-token expert-routing trace hook +
   `simulate-cache.py` (design data, not a runtime change).
 - **`experiments/slot-cache`** — the persistent GPU expert slot cache and its
