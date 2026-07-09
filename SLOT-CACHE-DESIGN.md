@@ -515,3 +515,45 @@ baseline (byte-identical); all carry-forward unit oracles re-run PASS; token-agr
    sharing (copy_backend should be fully dedicated).
 Recommend: un-starve the ring (fix 1), then run the equal-VRAM matrix at ncmoe 26-28. Paused for
 owner direction before the bench matrix.
+
+### Phase 2 pause (iii): the ceiling is real - phase 2 does not ship as a tg win. (2026-07-08)
+Ring resize un-starved promotion; correctness stayed byte-exact throughout. But tg did not move,
+and the equal-VRAM matrix (partial - run stopped after the static half) makes the verdict clear.
+
+**Ring fix worked (decode, ncmoe36):** hit rate S=32 14.1% -> **89.1%** (sync 90.4%), S=48 92.4%;
+ppl 458.9669 == baseline (byte-exact at 89% real GPU hits); all 4 unit oracles re-pass.
+
+**But tg is flat at the ceiling (ncmoe36):** S=32 1.51, S=48 1.05 - vs baseline-off 19.40, DESPITE
+89-92% hit. Higher hit rate cannot help because every CPU layer still pays its full activation
+DtoH round-trip + the two-path (GPU slot + CPU skip) combine - the copy is a graph edge, not a
+data decision (nsys: 162 GB DtoH dominates, unchanged by hit rate).
+
+**Equal-VRAM matrix, static (off) champion + references, tg128 r5 (clean box):**
+
+| config | tg128 t/s |
+|---|---|
+| off ncmoe22 (static champion) | 30.50 +/- 7.08 |
+| off ncmoe24 | 29.24 +/- 7.01 |
+| off ncmoe26 | 26.98 +/- 5.93 |
+| off ncmoe28 | 24.80 +/- 5.79 |
+| **cache ncmoe36 S32 (async, 89% hit)** | **1.51** |
+| **cache ncmoe36 S48 (async, 92% hit)** | **1.05** |
+
+(Cache ncmoe 24/26/28 points not captured - matrix stopped after the static half. The two-path
+overhead scales with CPU-layer count, so lower ncmoe is somewhat less bad, but starts ~13-20x below
+static and cannot close the gap: the activation-edge cost per CPU layer is independent of hit rate.)
+
+**SHIP VERDICT: NO.** Phase 2 is CORRECT (ppl byte-exact at 89% real GPU hits - the whole
+mechanism, incl. async promotion, is verified end to end) but the option-(c) two-path design cannot
+beat a static split on tg, because a CPU-resident layer pays the activation round-trip whether it
+computes 4 experts or 0. Warmup ~36 tokens (budget 32/token, ~1152 slots) - as expected, not the issue.
+
+**ESCALATION TRIGGER (was always the finding-1 ceiling): the custom op / conditional graph.** To win,
+a fully-resident layer must skip the CPU op AND its activation DtoH entirely - i.e. option (a)'s
+custom on-device gather+matmul, OR a conditional graph edge that elides the CPU path when a layer's
+routed experts are all resident. That removes the graph-edge round-trip the two-path design cannot.
+This is a phase-3 design question for human review, not a phase-2 tuning knob.
+
+**Verified reusable assets (all byte-exact, carry forward): ggml_mul_mat_id_skip (+CUDA guard),
+ggml_backend_event_query, slot buffers + async ring + get_rows indirection, GGML_MOE_SLOT_CACHE /
+_SYNC / _RING / _BUDGET, GGML_MOE_CACHE_SIM. The correctness scaffolding for phase 3 is done.**
