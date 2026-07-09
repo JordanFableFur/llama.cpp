@@ -1,6 +1,6 @@
 # Running a 120B Mixture-of-Experts Model on a Consumer Windows PC: Measurements, Dead Code, and the Anatomy of an Expert Cache
 
-**Tech report v0.2 — 2026-07-09.** Status: working draft; single model, single machine. Every
+**Tech report v1.0 — 2026-07-09.** Status: single model, single machine; consolidated. Every
 number cites a raw artifact committed to this repository (`bench-results/`, branch names inline).
 Authored by AI agents (Claude Fable 5, Claude Opus 4.8) under the verification-over-authorship
 policy of this fork ([CONTRIBUTING.md](CONTRIBUTING.md)); all claims are gated on committed logs.
@@ -27,8 +27,24 @@ matmul (S-independent, ~18 µs), promotion machinery (async, verified overlap), 
 per-layer two-path orchestration in the graph scheduler, a cost that *rises* with hit rate — later
 positively isolated (§5.1: two-path alone drops tg 18.4→1.5 at S=48, capture is free) and, since
 routing escapes a fully-resident-layer prediction on ~100% of tokens at feasible VRAM budgets,
-token-level elision is killed at the design gate and the cache parked. We release the trace
-tooling, cache simulator, all raw logs, and the verified primitives.
+token-level elision is killed at the design gate and the cache parked; (6) the same routing
+geometry defeats self-speculation (draft = the model with routing restricted to VRAM-resident
+experts): a batched verify amortizes expert reads only 1.7–1.9x (a K=8 window still touches ~18 of
+32 possible experts/layer), and acceptance is too low to cover it — projected speedup ≤1.14x in all
+three domains against a 1.25x bar, and the mechanism is anyway prior art (SS-MoE). We release the
+trace tooling, cache simulator, the draft-agreement diagnostic, all raw logs, and the verified
+primitives.
+
+**Thesis.** gpt-oss-120b's expert routing is *spatially concentrated but temporally restless* —
+few experts dominate each layer (per-layer Gini 0.72), yet the hot set churns token-to-token so
+completely that a 76%-per-layer-resident cache still misses on ~100% of tokens somewhere in 36
+layers. Concentration is what makes caching and speculation look promising (high achievable hit
+rate, high per-layer skew); restlessness is what defeats both at a consumer VRAM budget. Every
+technique that tries to convert residency into a decode speedup — exact elision, speculative
+elision, capture-then-replay, resident-only self-drafting — founders on the same fact: the residual
+misses land on high-weight experts on essentially every token, and there is no temporal stability in
+the working set to amortize against. Hit rate is necessary and, on this class of hardware, decisively
+insufficient.
 
 ## 1. Setup
 
@@ -214,7 +230,89 @@ What survives is reusable: the everything-off-control rule (A), free routing cap
 per-token-escape compounding law (C) — a general bound on token-level expert elision at any MoE
 residency short of ~full.
 
-## 6. Process notes (why the numbers are trustworthy)
+## 5.2 Self-speculation over the same cache also fails (item 17)
+
+If elision cannot exploit residency inside one layer, can speculation exploit it across tokens? The
+idea (Jordan's): the *draft* is the same model with routing restricted to only the VRAM-resident
+experts (mask non-resident experts out of the router's top-k, renormalize) — so the draft needs zero
+DDR5 expert reads — and a full-model *verify* runs once every K tokens in a batched pass that
+amortizes the ~1.2 GB/token expert stream over the window. Decided by three offline gates before any
+engine (env-gated diagnostic `GGML_MOE_DRAFT_SIM`, harness `llama-draftsim`; branch
+`experiments/slot-cache`, validated byte-identical at all-resident and ppl 458.9669 with it off).
+
+**Gate (a) — verify amortization is weak.** A batched K-token verify streams each *unique* expert
+once, so its cost is the unique-experts-per-layer-per-window count, not K×4. But MoE routing has
+little temporal locality: even K=8 touches ~17–18 unique of 32 possible experts/layer → amortization
+only **1.7–1.9x**, verify_cost(K=8) ≈ 4.3–4.6 plain-token-times
+(`bench-results/item17-gate-a-amortization.txt`).
+
+**Gate (b) — draft agreement, and the entropy-decoupling finding.** Teacher-forced ≥2K tokens/domain,
+greedy argmax, routing restricted to the S=48 resident set (`bench-results/item17-gate-b-agreement.txt`):
+
+| S=48 | top-1 agreement | accept(4) | accept(6) | accept(8) |
+|---|---|---|---|---|
+| WIKI (prose) | 61.8% | 1.45 | 1.64 | 1.71 |
+| CODE (worst dropped-mass) | 89.6% | 3.17 | 4.43 | 5.53 |
+| CHAT (best dropped-mass) | 89.4% | 3.09 | 4.22 | 5.16 |
+
+The key surprise: **draft agreement tracks output-token *entropy*, not expert dropped-mass.** Code is
+the *worst* domain for dropped weight-mass (7.34%, §5.1) yet the *best* for token agreement (89.6%),
+because its output is low-entropy (syntax, boilerplate) — dropping a top expert and renormalizing
+rarely flips a token the context already determines. High-entropy prose (wiki) flips 38% of tokens on
+the same perturbation. This decoupling is exactly why gate (b) had to be *measured*: the §5.1
+mispredict analysis, which prices expert-mass damage, cannot predict token acceptance.
+
+**Gate (c) — novelty: ADJACENT (not novel).** The nearest prior art, **SS-MoE** (ACM Web Conference
+2026, DOI 10.1145/3774904.3792218), already couples same-model self-speculation with routing masked
+to a resident expert subset for memory-limited MoE. SP-MoE (arXiv 2510.10302), MoE-SpeQ (2511.14102),
+and llama.cpp MTP (PR #22673) all use a *separate* draft model or trained heads — distinct, but they
+establish the surrounding design space. Only the dynamic-LRU-residency-defined draft fused with the
+offload cache is narrowly new — not enough to carry the item alone.
+
+**Verdict: stop, do not implement.** Projected speedup =
+`champion(29.7)·accept(K)/(draft_frac·K + verify_cost(K))` peaks at **1.14x** across all
+domains/K/draft-cost assumptions (code, K=4, cheapest draft, optimistic +1 verify bonus); realistic
+cases are ≤1.0x, against a **1.25x** ship bar (`project-speedup.py`). verify_cost is a lower bound
+(ignores fixed, attention, and graph-rebuild cost), so the projection is biased toward GO and still
+fails. The memory wall the self-draft was meant to hide is not hidden: verify must still stream
+unique(K) experts, gate (a) says that is only 1.7–1.9x cheaper than plain, and acceptance (gate b)
+cannot cover even that.
+
+## 6. Synthesis: spatially concentrated, temporally restless routing
+
+Three independent attack surfaces — a byte-exact residency cache (§5), token-level elision (§5.1),
+and cross-token self-speculation (§5.2) — fail for one shared reason, and it is a property of the
+routing, not of any implementation.
+
+- **Spatial concentration is real and exploitable-looking.** Per-layer routing is skewed (Gini 0.72,
+  §4); 48 slots/layer capture 92–96% of requests (§4 sim); the slot cache hits 92% for real (§5).
+  Every "should work" intuition about caching MoE experts starts here and is correct as far as it goes.
+- **Temporal restlessness is the killer.** The hot set is not stable token-to-token. 76% per-layer
+  full-residency compounds across 36 independent layers to ~100% per-token escape (§5.1); the residual
+  misses are not low-weight tail experts but land on the token's *top* expert ~1 in 5 times, domain-
+  invariantly (§5.1). So the 8% of requests the cache misses are not cheap to skip (they carry real
+  weight-mass) and not rare per token (they hit every token somewhere).
+- **Both caching and speculation need temporal stability the routing denies.** Exact elision must fall
+  back to a per-layer two-path that costs more than it saves (§5, §5.1). Speculative elision perturbs
+  quality on ~every token (§5.1). Self-speculation's verify cannot amortize because a K-token window
+  has almost no expert reuse (§5.2 gate a), and drafting on the resident set flips high-entropy tokens
+  (§5.2 gate b). The one lever that would help all three — a working set that holds still for a few
+  tokens — is precisely what a general-purpose 128-expert top-4 router at a ~37%-of-experts VRAM budget
+  does not provide.
+
+The practical consequence for this hardware class: the shipped win is **static** (host pinning +
+micro-batch + offload-split tuning, §3: 37x prefill / 3.4x generation over the contaminated baseline,
+all zero-algorithm), and dynamic expert management — cache, prune, or speculate — does not beat a
+well-tuned static offload at a consumer VRAM budget on this model. That is a negative result with a
+mechanism, not a failure to engineer.
+
+## 6.1 The trained-draft counterpoint: MTP over offload (GLM-4.5-Air)
+
+<!-- MTP-OFFLOAD-RESULT: filled by the GLM-4.5-Air --mtp bench (deliverable 3). -->
+*(Measurement in progress — GLM-4.5-Air Q4_K_M, `--mtp` on/off × two offload splits, paired
+interleaved r≥8. Results and artifact path land here.)*
+
+## 7. Process notes (why the numbers are trustworthy)
 
 This fork accepts AI-generated contributions and compensates with mandatory verification
 (gates before claims, artifacts over summaries, kill-lists for refuted ideas). Empirically the
@@ -225,20 +323,24 @@ number but not all the numbers. Sessions were run by two different AI models in
 designer/executor/reviewer roles with explicit pause points; the full decision trail is in
 EXPERIMENTS.md and SLOT-CACHE-DESIGN.md.
 
-## 7. Limitations and next
+## 8. Limitations and next
 
-Single model (gpt-oss-120b), single machine, single OS. The trace tooling and simulator port
-directly to other MoE families (Qwen3-Next, GLM-4.x) — the first replication target. Resolved
-since v0.1: phase-3 go/no-go (§5.1 — two-path isolated, elision killed at the design gate, item 15
-parked); resident-experts self-speculation (EXPERIMENTS.md item 17 — offline gates STOP: projected
-speedup ≤1.14x in all three domains vs the 1.25x bar, amortization only 1.7–1.9x, novelty ADJACENT
-to SS-MoE). Pending: pinned-flag champion re-run for the final table, page-aligned expert slab
-layout (item 18).
+Single model (gpt-oss-120b), single machine, single OS. Our results are about *dynamic expert
+management under offload*; they do not speak to models that fit in VRAM, to trained speculative heads
+(MTP), or to other MoE geometries. The trace tooling and simulator port directly to other MoE
+families (Qwen3-Next, GLM-4.x) — the first replication target. The one dynamic technique we have not
+exhausted is a *trained* draft: multi-token-prediction heads shipped inside the model (§6.1) sidestep
+the acceptance problem that killed resident-only self-drafting, because the draft is learned rather
+than derived from cache state. Pending: pinned-flag champion re-run for the final table, page-aligned
+expert slab layout (EXPERIMENTS.md item 18).
 
 ## Artifacts
 
-- Benchmarks: `bench-results/` (raw logs for every table above), BENCHMARKS.md
+- Benchmarks: `bench-results/` (raw logs for every table above; `item15-*`, `item17-*` for §5.1–5.2),
+  BENCHMARKS.md
 - Tooling: routing-trace hook (env-gated), `simulate-cache.py`, `analyze-routing-skew.py`,
+  `analyze-mispredict.py` (§5.1); `GGML_MOE_DRAFT_SIM` diagnostic + `llama-draftsim` harness,
+  `analyze-amortization.py`, `gen-draft-masks.py`, `compare-argmax.py`, `project-speedup.py` (§5.2);
   microbenches and unit oracles in `tests/`
 - Code: `experiments/prefetch-experts-win`, `win-mmap-pressure`, `win-fast-load`,
   `routing-trace`, `slot-cache`

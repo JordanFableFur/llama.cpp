@@ -100,3 +100,45 @@ GGML_CUDA_REGISTER_HOST=1 llama-bench -m gpt-oss-120b-mxfp4.gguf \
 (~37x pp, ~3.4x tg). The gains: (1) not benchmarking under load, (2) host
 pinning (~2x pp), (3) ub=2048 (~3x pp), (4) ncmoe=22 sitting just above the VRAM
 cliff (+16% tg), (5) flash-attn (+15% pp).
+
+TL;DR for an RTX 5090-class box + gpt-oss-120b MXFP4: `-ngl 99 -ncmoe 22 -fa 1
+-b 4096 -ub 2048` with `GGML_CUDA_REGISTER_HOST=1`, on an idle box, all CPU cores.
+
+## Generation: warm vs cold GPU clock (read before comparing tg numbers)
+
+The **41 tg** headline is a *warm-clock* number: llama-bench runs a `-p 2048`
+prefill immediately before the tg pass, which ramps the GPU boost clock, so the
+generation phase runs at full clock. A *cold-clock* decode — pure `-p 0 -n 128`,
+i.e. generation starting from an idle GPU with no prefill to warm it — measures
+**29.7 tg** at the same ncmoe 22 (`bench-results/`, `-p 0` runs). The ~11 tg gap
+is entirely GPU clock-warming, not an algorithmic difference.
+
+Which one is "real" depends on your usage: sustained generation after a long
+prompt sees the warm number; short bursty single-turn decode from cold sees the
+cold number. **We use the cold-clock 29.7 tg as the honest single-user champion**
+for any decode-speedup comparison (e.g. the expert-cache work in
+[EXPERIMENTS.md](EXPERIMENTS.md) / [TECH-REPORT.md](TECH-REPORT.md)), because a
+technique must beat the baseline under the *same* clock state it runs in. Report
+tg with its `-p` value or the number is ambiguous.
+
+## Shipped branches
+
+The only ships from the campaign are static, zero-algorithm config/plumbing fixes
+(the [TECH-REPORT.md](TECH-REPORT.md) §6 thesis: dynamic expert management does not
+beat well-tuned static offload at a consumer VRAM budget on this model). Branches
+on `github.com/JordanFableFur/llama.cpp`:
+
+- **`experiments/prefetch-experts-win`** — Windows host pinning (the ~2.1x pp win).
+  The mmap `cudaHostRegister` path was dead code behind a POSIX-only guard; this
+  builds it on Windows. (The branch's prefetch *scheduling* is neutral-to-negative
+  and not recommended — only the pinning matters.)
+- **`experiments/win-mmap-pressure`** — release GPU-uploaded mmap pages from the
+  working set (`VirtualUnlock`); 47.2 → 24.0 GB resident during generation,
+  output-identical.
+- **`experiments/win-fast-load`** — honest `--direct-io` on Windows (was silently
+  advertised-but-unimplemented).
+- **`experiments/routing-trace`** — env-gated per-token expert-routing trace hook +
+  `simulate-cache.py` (design data, not a runtime change).
+- **`experiments/slot-cache`** — the persistent GPU expert slot cache and its
+  diagnostics: **correct but not faster** (parked; see TECH-REPORT.md §5–5.2). Kept
+  for the verified primitives and the negative-result trail, not for adoption.

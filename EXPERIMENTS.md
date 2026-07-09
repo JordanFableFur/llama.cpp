@@ -75,6 +75,9 @@ Per-lever verdict (clean box):
 
 ## Re-ranked queue (post Tier 0, 2026-07-08)
 
+> **Superseded 2026-07-09 — see "## Consolidation + final re-rank" at the end of this file.** The
+> dynamic-expert-management arc (items 15/16/17/18) is closed; only static items remain live.
+
 Clean-box measurement changed the priorities. pp is already ~1790 (fa+ub2048+pin); tg ~37 and bandwidth-bound. Ranking by value/risk against the clean baseline:
 
 Code anchors from tonight's source read are inline so these are executable, not aspirational.
@@ -327,3 +330,51 @@ time; box was clean (2.9 GB VRAM idle) throughout; no OOM/wedge.
 item 15 phase 0/1 per SLOT-CACHE-DESIGN.md (telemetry gate first). (3) if a human grants
 SeLockMemoryPrivilege, revisit item 13. (4) consider PRs for routing-trace and win-mmap-pressure
 (both verified, self-contained).
+
+## Consolidation + final re-rank — 2026-07-09
+
+The dynamic-expert-management arc is closed. Every technique that tries to convert expert *residency*
+into a decode speedup failed against a well-tuned static offload, for one measured reason: gpt-oss-120b
+routing is **spatially concentrated but temporally restless** (per-layer Gini 0.72, but 76%-per-layer
+residency compounds to ~100% per-token miss across 36 layers). See TECH-REPORT.md v1.0 §5–6.
+
+**Final status of every dynamic idea:**
+- **Item 15 (persistent GPU slot cache) — PARKED.** Byte-exact correct at 92% real GPU hits, but
+  slower than no cache (two-path split, isolated via NOCAP: tg 18.4→1.5 at S=48). Phase-3 elision
+  killed at the design gate (per-token-escape compounding). Reusable primitives kept on
+  `experiments/slot-cache`. (SLOT-CACHE-DESIGN.md, TECH-REPORT §5–5.1.)
+- **Item 16 (REAP static pruning) — REJECTED.** Cross-domain idle-expert overlap 29.2% ≈ random;
+  workload-specific hotness lobotomizes off-domain.
+- **Item 17 (resident-only self-speculation) — STOP.** Three offline gates: amortization 1.7–1.9×
+  (a), projected speedup ≤1.14× vs 1.25× bar (b), novelty ADJACENT to SS-MoE (c). Not implemented.
+  Entropy-decoupling finding: draft agreement tracks output-token entropy, not dropped-mass.
+  (TECH-REPORT §5.2, `bench-results/item17-*`.)
+- **Item 18 (page-aligned expert slabs) — PARKED with item 15.** It optimized slot-cache promotion;
+  with the cache parked it loses its primary consumer. Its independent value (dissolving the
+  copy-straddle landmine for item 12 pinning) stands but is low-priority.
+- **MTP-over-offload (GLM-4.5-Air, trained-draft counterpoint) — <!-- MTP-VERDICT -->measurement pending.**
+  The one dynamic technique not yet exhausted: a *trained* multi-token-prediction head sidesteps the
+  acceptance problem that killed resident-only self-drafting. Bench: `--spec-type draft-mtp` on/off ×
+  two offload splits, paired r≥8. (TECH-REPORT §6.1.)
+
+**What shipped (all static, zero-algorithm):** host pinning (`prefetch-experts-win`, ~2.1× pp),
+ub=2048 micro-batch (~3× pp), ncmoe=22 offload split (+16% tg), Windows working-set release
+(`win-mmap-pressure`), honest `--direct-io` (`win-fast-load`). Net vs contaminated baseline: ~37× pp,
+~3.4× tg — none of it from dynamic expert management.
+
+**Remaining live queue (static only):** item 12 (pinned-staging bounce, supervised — crash landmine),
+item 13 (large pages, blocked on SeLockMemoryPrivilege), item 2/14 (no-mmap direct-io loader, niche).
+
+**Branch list (current):**
+- `ai-main` — queue + BENCHMARKS.md + TECH-REPORT.md v1.0 + SLOT-CACHE-DESIGN.md + simulators.
+- `experiments/slot-cache` — slot cache + item-17 draft-sim diagnostic + gate tooling (parked, kept).
+- `experiments/routing-trace` — MoE trace hook (item 1).
+- `experiments/win-mmap-pressure` — VirtualUnlock working-set release (item 9, shippable).
+- `experiments/win-fast-load` — honest has_direct_io() (shippable).
+- `experiments/prefetch-experts-win` — Windows host pinning (the ~2× pp win, shippable).
+- `master` — untouched, mirrors origin/master.
+
+**Session report (2026-07-09, consolidation):** folded item-15 phase-3 + item-17 gates into
+TECH-REPORT.md v1.0 (thesis + entropy-decoupling); BENCHMARKS.md user-facing pass (cold-clock note,
+branch links); ran the MTP-over-offload bench (GLM-4.5-Air, downloaded); final re-rank above. One
+llama process at a time; box clean. Stopped before any external-publication step (human call).
