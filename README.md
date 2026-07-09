@@ -1,7 +1,7 @@
 # llama.cpp (AI-contributions-welcome fork)
 
 > [!NOTE]
-> This is a community fork of [ggml-org/llama.cpp](https://github.com/ggml-org/llama.cpp) that **accepts AI-assisted and AI-generated contributions**, subject to mandatory verification (see [CONTRIBUTING.md](CONTRIBUTING.md)). Upstream does not accept AI-generated PRs; this fork exists so that work built with AI coding agents has a home, with correctness enforced by CI (build matrix, `test-backend-ops`, perplexity and benchmark regression checks) and human review rather than by authorship rules.
+> This is the **Fireside Labs** fork of [ggml-org/llama.cpp](https://github.com/ggml-org/llama.cpp) ([github.com/fireside-labs/llama.cpp](https://github.com/fireside-labs/llama.cpp)) — a community fork that **accepts AI-assisted and AI-generated contributions**, subject to mandatory verification (see [CONTRIBUTING.md](CONTRIBUTING.md)). Upstream does not accept AI-generated PRs; this fork exists so that work built with AI coding agents has a home, with correctness enforced by CI (build matrix, `test-backend-ops`, perplexity and benchmark regression checks) and human review rather than by authorship rules.
 >
 > - `master` tracks upstream and stays clean - upstream changes are pulled regularly
 > - `ai-main` is the default branch: upstream + this fork's accepted patches
