@@ -557,3 +557,35 @@ This is a phase-3 design question for human review, not a phase-2 tuning knob.
 **Verified reusable assets (all byte-exact, carry forward): ggml_mul_mat_id_skip (+CUDA guard),
 ggml_backend_event_query, slot buffers + async ring + get_rows indirection, GGML_MOE_SLOT_CACHE /
 _SYNC / _RING / _BUDGET, GGML_MOE_CACHE_SIM. The correctness scaffolding for phase 3 is done.**
+
+### Phase 2 diagnostics (2026-07-08): anomaly reconciled - NOT VRAM, NOT the async mechanism.
+Owner caught that async-S32 (1.51 tg, 89% hit) < sync-S8 (3.49 tg, 44% hit) - inconsistent with a
+purely hit-rate-independent activation wall. Three diagnostics (async, ncmoe36, 32-ring):
+
+| S | tg128 | hit% | token-boundary host ms | peak VRAM (used) |
+|---|---|---|---|---|
+| 8  | 3.85 | 67.4 | 25.1 |  9.7 GB |
+| 32 | 1.50 | 90.2 | 10.2 | 20.6 GB |
+| 48 | 1.05 | 93.8 |  6.4 | 27.8 GB |
+
+1. **VRAM oversubscription REFUTED.** Peak used 27.8 GB at S=48 (< 32 GB, no WDDM paging cliff). The
+   slot pools fit; the big-S slowdown is not VRAM thrash.
+2. **Async mechanism SOUND.** Apples-to-apples: async S=8 (3.85 tg, 67% hit) > sync S=8 (3.49, 44%).
+   Same S, async wins - no cost bug in the ring/event machinery. (Owner's 1.51-vs-3.49 was S32-vs-S8.)
+3. **Token-boundary host cost real but not the S-trend cause:** 25 ms (S8) -> 6 ms (S48), i.e. it
+   scales with promotion volume (miss rate), INVERSELY with S. ~10% of the token at S8.
+4. **The real cost: the two-path GPU orchestration, and it grows with hit rate.** Subtracting boundary,
+   non-boundary token time balloons 235 -> 657 -> 946 ms as S grows. Higher hit -> more expert compute
+   shifted onto the GPU slot path, whose per-layer cross-backend combine (ggml_add of the GPU-slot
+   result and the CPU-skip result) + scheduling overhead costs MORE than the CPU compute it displaces
+   at ncmoe 36. This is structural to option (c) (both paths run every layer, then combine), independent
+   of VRAM. It is the ~4x, and higher hit rate makes it worse, not better.
+
+**Reconciled ceiling:** option (c)'s per-layer two-path combine is the binding cost at high ncmoe, on
+TOP of the hit-rate-independent activation DtoH. Phase 3's single-path custom op / conditional graph
+(compute each expert once on the right backend, no per-layer combine, elide the CPU op + its DtoH when
+a layer is fully resident) removes BOTH. Design phase 3 against this reconciled stack.
+
+**Consistency flag:** static ncmoe22 champion read 30.5 tg here (r5, +/-7 variance) vs Tier-0's 41
+(r8, pinned GGML_CUDA_REGISTER_HOST=1). This run set had NO pinning and high variance - re-run the
+champion with the full flag set before any ship/no-ship table is published.
