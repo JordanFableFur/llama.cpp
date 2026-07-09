@@ -55,6 +55,15 @@ struct moe_trace_state {
     bool                 header_done = false;
     std::vector<int32_t> frame;
 
+    // weighted trace dump (ids + final router weights per selected expert) - GGML_MOE_TRACEW
+    // frame: int32 layer, int32 n_tokens, int32[nt*neu] ids, float32[nt*neu] weights (row-major r*neu+k)
+    FILE *               fpw          = nullptr;
+    bool                 headerw_done = false;
+    int                  n_expert_g   = 0;   // remembered from the gate op for the weighted header
+    int                  neu_g        = 0;
+    std::map<int, std::vector<float>> pending_w;   // layer -> this eval's final weights [nt*neu], erased on use
+    std::vector<uint8_t> w_host;
+
     // in-engine cache sim
     bool                 sim_on = false;
     std::vector<int>     sim_slots;                  // S values
@@ -70,6 +79,11 @@ void moe_trace_report() {
         fflush(g.fp);
         fclose(g.fp);
         g.fp = nullptr;
+    }
+    if (g.fpw) {
+        fflush(g.fpw);
+        fclose(g.fpw);
+        g.fpw = nullptr;
     }
     if (!g.sim_on || g.sim.empty()) {
         return;
@@ -97,7 +111,30 @@ bool moe_trace_cb(struct ggml_tensor * t, bool ask, void * user_data) {
     const struct ggml_tensor * src0 = t->src[0];
 
     if (ask) {
-        return t->op == GGML_OP_MUL_MAT_ID && src0 && strstr(src0->name, "ffn_gate_exps") != nullptr;
+        const bool is_gate = t->op == GGML_OP_MUL_MAT_ID && src0 && strstr(src0->name, "ffn_gate_exps") != nullptr;
+        // final router weights for the weighted trace: any "ffn_moe_weights*" node (get_rows, then the
+        // softmax/norm/scaled stages); we keep the last-firing per layer = the weights that scale outputs.
+        const bool is_w = g.fpw && strncmp(t->name, "ffn_moe_weights", 15) == 0 &&
+                          strstr(t->name, "_sum") == nullptr; // exclude the [1,nt] weight-sum reductions
+        return is_gate || is_w;
+    }
+
+    // weighted trace: buffer this layer's final router weights until its gate op writes the paired frame.
+    // graph order is get_rows -> softmax -> norm -> scaled -> gate mul_mat_id, so overwriting per layer
+    // leaves pending_w holding the last (final) weight stage before the gate reads it.
+    if (g.fpw && strncmp(t->name, "ffn_moe_weights", 15) == 0 && strstr(t->name, "_sum") == nullptr) {
+        int wl = -1;
+        const char * dash = strrchr(t->name, '-');
+        if (dash) { wl = atoi(dash + 1); }
+        if (wl >= 0 && ggml_is_contiguous(t)) {
+            const int64_t n = ggml_nelements(t);   // neu*nt, contiguous, flat[k + r*neu]
+            g.w_host.resize(ggml_nbytes(t));
+            ggml_backend_tensor_get(t, g.w_host.data(), 0, ggml_nbytes(t));
+            std::vector<float> & wv = g.pending_w[wl];
+            wv.assign(n, 0.0f);
+            memcpy(wv.data(), g.w_host.data(), n * sizeof(float));
+        }
+        return true;
     }
 
     const struct ggml_tensor * ids = t->src[2];
@@ -139,6 +176,34 @@ bool moe_trace_cb(struct ggml_tensor * t, bool ask, void * user_data) {
         fwrite(g.frame.data(), sizeof(int32_t), g.frame.size(), g.fp);
     }
 
+    // weighted trace: pair this gate op's ids with the layer's buffered final weights
+    if (g.fpw) {
+        if (!g.headerw_done) {
+            const int32_t header[3] = { 0x57454f4d /* 'MOEW' */, (int32_t) n_expert, (int32_t) n_expert_used };
+            fwrite(header, sizeof(int32_t), 3, g.fpw);
+            g.headerw_done = true;
+        }
+        auto wit = g.pending_w.find(layer);
+        const bool have_w = wit != g.pending_w.end() &&
+                            (int64_t) wit->second.size() == n_tokens * n_expert_used;
+        std::vector<int32_t> ihdr = { layer, (int32_t) n_tokens };
+        fwrite(ihdr.data(), sizeof(int32_t), 2, g.fpw);
+        std::vector<int32_t> idv; idv.reserve(n_tokens * n_expert_used);
+        for (int64_t r = 0; r < n_tokens; ++r) {
+            for (int64_t k = 0; k < n_expert_used; ++k) {
+                idv.push_back(*(const int32_t *) (base + r * ids->nb[1] + k * ids->nb[0]));
+            }
+        }
+        fwrite(idv.data(), sizeof(int32_t), idv.size(), g.fpw);
+        if (have_w) {
+            fwrite(wit->second.data(), sizeof(float), wit->second.size(), g.fpw);
+        } else {
+            std::vector<float> zeros(n_tokens * n_expert_used, 0.0f); // weights callback did not fire for this layer
+            fwrite(zeros.data(), sizeof(float), zeros.size(), g.fpw);
+        }
+        if (wit != g.pending_w.end()) { g.pending_w.erase(wit); } // consume: stale-guard for the next eval
+    }
+
     if (g.sim_on) {
         auto it = g.sim.find(layer);
         if (it == g.sim.end()) {
@@ -160,9 +225,10 @@ bool moe_trace_cb(struct ggml_tensor * t, bool ask, void * user_data) {
 } // namespace
 
 void common_moe_trace_maybe_install(common_params & params) {
-    const char * trace_path = getenv("GGML_MOE_TRACE");
-    const char * sim_env    = getenv("GGML_MOE_CACHE_SIM");
-    if ((!trace_path || !*trace_path) && (!sim_env || !*sim_env)) {
+    const char * trace_path  = getenv("GGML_MOE_TRACE");
+    const char * tracew_path = getenv("GGML_MOE_TRACEW");
+    const char * sim_env     = getenv("GGML_MOE_CACHE_SIM");
+    if ((!trace_path || !*trace_path) && (!tracew_path || !*tracew_path) && (!sim_env || !*sim_env)) {
         return;
     }
     if (params.cb_eval != nullptr) {
@@ -176,6 +242,15 @@ void common_moe_trace_maybe_install(common_params & params) {
             LOG_ERR("%s: failed to open MoE trace file '%s'\n", __func__, trace_path);
         } else {
             LOG_INF("%s: MoE routing trace enabled -> %s\n", __func__, trace_path);
+        }
+    }
+
+    if (tracew_path && *tracew_path) {
+        g.fpw = fopen(tracew_path, "wb");
+        if (!g.fpw) {
+            LOG_ERR("%s: failed to open MoE weighted trace file '%s'\n", __func__, tracew_path);
+        } else {
+            LOG_INF("%s: MoE weighted routing trace enabled -> %s\n", __func__, tracew_path);
         }
     }
 
@@ -200,7 +275,7 @@ void common_moe_trace_maybe_install(common_params & params) {
         }
     }
 
-    if (g.fp || g.sim_on) {
+    if (g.fp || g.fpw || g.sim_on) {
         atexit(moe_trace_report);
         params.cb_eval           = moe_trace_cb;
         params.cb_eval_user_data = nullptr;
