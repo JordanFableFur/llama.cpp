@@ -222,6 +222,23 @@ chat (52.0K tok, 4 merged generations):
     Sequenced AFTER item 15 phases 0-2 (the cache is what makes the draft accurate). Heaviest
     engineering item on the board (masked routing + rollback in the decode graph).
 
+18. **MoE-aware GGUF layout: page-aligned expert slabs (Jordan's idea, 2026-07-08).** Offline
+    repack (GGUF stays the container; this is a layout convention + loader awareness): pad every
+    expert slab to a page boundary (~18 MB overhead on 59 GB) and store each expert's
+    gate/up/down adjacent as one contiguous "promotion unit." What it buys, tied to measured
+    constraints: (a) DISSOLVES the copy-straddle landmine — experts stop sharing pages, so
+    per-expert cudaHostRegister/copy becomes legal (the constraint that killed chunked pinning
+    and forced the staging ring's host-memcpy hop); (b) slot-cache promotion = one contiguous
+    copy instead of three scattered ones, and pinned-slab experts can skip the ring's memcpy;
+    (c) selective pinning under the 36 GB WDDM cap becomes possible (choose WHICH experts are
+    pinned, e.g. by promotion frequency). Honest sizing: incremental (simplifies + trims
+    promotion cost; does not change bandwidth math). **Gates:** (a) repack script + loader
+    accepts padded layout, temp-0 output identical; (b) per-expert registration proven on the
+    repacked file (the old crash signature must NOT reproduce); (c) promotion-cost delta
+    measured in the phase-2 cache A/B. Sequenced after item 15 phase 2 (that's what it
+    optimizes). Do not reorder experts by hotness in the file — workload-dependence killed
+    static ordering (item 16).
+
 Parked / rejected:
 - Chunked host registration — crashes (copy-straddle), see above.
 - Upload-only-routed-experts at prefill — worthless at ub≥512 (P(expert unused) ≈ e^-16).
