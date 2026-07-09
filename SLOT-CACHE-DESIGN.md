@@ -727,3 +727,46 @@ reuse-loss measurement is the term that decides it.
 the cache, publish the observer-effect finding. P3.1 reuse-loss measurement exceeds projected
 elision savings → park before implementation. Any correctness gate fails → stop per standing
 condition 3.
+
+### P3.0 DONE (2026-07-09), `experiments/slot-cache` (d24a8320c). Capture is FREE; the wall is the two-path split — NOT capture.
+Fused capture: `ggml_mul_mat_id_skip` gained an optional src[4]; its CPU forward copies the routed
+ids (already in host memory as src[2]) into the cache's host side-buffer (`ls->routed`) during the
+matmul it already runs — no extra graph node, callback, or sync. Only the gate op captures (up/down
+route identically). `capture_mode 3` is now the default. New `GGML_MOE_SLOT_NOCAP` builds the
+two-path but disables capture+update, to isolate the two-path structural cost from the capture —
+**the cell the phase-2 A/B never measured.**
+
+**Gate (a) — full correctness chain, ALL PASS (exact):**
+- ppl-exact: **458.9669** OFF == ON (full active, 97.7% GPU residency) == forced-empty (NOPROMO).
+  Byte-identical over 11 chunks, n_ctx=512, wikichunk. Off-switch re-verified byte-identical.
+- unit oracles 4/4: test-mul-mat-id-skip (incl. new gate (e): fused capture copies ids for every
+  token INDEPENDENT of the skip mask), test-slot-matmul (M5b byte-identical), test-slot-ring,
+  test-event-query.
+- hit-rate canary: **66.5% (S=8) / 92.4% (S=48)** — EXACT match to cpy-sink/callback/GPU-sink and
+  the phase-1/2 sim. Fused capture extracts identical routing → capture is correct.
+
+**Gate (b) — tg ≈ NOBOOK within 5%: FAIL. But the decomposition flips the verdict.**
+
+| ncmoe36 tg128 (r3, -p 0) | S=8 | S=48 | isolates |
+|---|---|---|---|
+| NOBOOK (plain path, no two-path, no capture) | 19.15 ± 3.33 | 18.40 ± 3.87 | baseline (flat in S) |
+| NOCAP (two-path built, **capture OFF**, update OFF) | 5.59 ± 0.41 | 1.48 ± 0.03 | two-path split ALONE |
+| fused (two-path + fused capture + update) | 5.16 ± 0.31 | 1.52 ± 0.04 | + capture + promotion |
+
+**Capture was never the cost.** NOCAP (capture fully disabled) already collapses tg to 5.59/1.48;
+adding fused capture + update on top is free (5.16/1.52, within noise). P3.0's objective — cost-free
+capture — is ACHIEVED. The phase-2 verdict ("per-token routing EXTRACTION is itself the cost") was a
+**misattribution**: every capture mechanism in that A/B was measured on top of the two-path, which had
+already collapsed tg to ~5 before any capture was added. The one point that seemed to isolate capture
+(NOSLOT 3.83 vs NOBOOK 18.4) used the PLAIN compute path + cpy-sink — a *different* graph split. There
+are two independent split costs; the two-path structure is the one the cache actually incurs.
+
+**The wall is the two-path graph structure:** each cached CPU layer becomes GPU-slot `mul_mat_id` +
+CPU-skip `mul_mat_id_skip` + GPU `add`. The CPU op sandwiched between GPU ops is a split point, 36×/
+token, serializing the pipeline. It WORSENS with S (bigger slot `mul_mat_id`): S=48 is 1.5, S=8 is 5.6.
+
+**Verdict: do NOT park.** The doc's stop condition ("gate (b) fails → capture fundamentally expensive
+→ park") rests on a premise the NOCAP measurement disproves. Capture is free; the isolated, quantified
+wall (19→5.6 at S=8, 18.4→1.5 at S=48) is **exactly what P3.1 conditional elision removes** — a
+fully-resident layer goes GPU-only (no CPU op, no split). P3.1 is now the decisive test, and its target
+cost is cleanly measured rather than assumed. **STOP for review before P3.1 per standing conditions.**
