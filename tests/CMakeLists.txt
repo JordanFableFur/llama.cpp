@@ -152,6 +152,7 @@ endif ()
 llama_build_and_test(test-mul-mat-id-skip.cpp)
 llama_build_and_test(test-slot-matmul.cpp)
 llama_build_and_test(test-slot-ring.cpp)
+llama_build_and_test(test-slot-matmul-bench.cpp)
 llama_build_and_test(test-event-query.cpp)
 
 if (NOT WIN32 OR NOT BUILD_SHARED_LIBS)
