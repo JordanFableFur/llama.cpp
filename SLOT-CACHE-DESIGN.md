@@ -589,3 +589,29 @@ a layer is fully resident) removes BOTH. Design phase 3 against this reconciled 
 **Consistency flag:** static ncmoe22 champion read 30.5 tg here (r5, +/-7 variance) vs Tier-0's 41
 (r8, pinned GGML_CUDA_REGISTER_HOST=1). This run set had NO pinning and high variance - re-run the
 champion with the full flag set before any ship/no-ship table is published.
+
+### Phase 2, deeper diagnostics (2026-07-08): slot kernel cleared; S-swing mechanism bounded.
+Owner rejected the two-path-combine explanation (it is constant in S; the data scales with S) and
+suspected the slot mul_mat_id falling off the fast kernel path as S grows. Tested directly.
+
+**Isolated slot-matmul microbench (tests/test-slot-matmul-bench.cpp), MXFP4 [2880,2880,S+1], decode
+(1 tok, 4 routed), CUDA:** FLAT ~18 us/op from S=8 (50 MB) to S=128 (560 MB) - 0.95-1.00x. The slot
+kernel is S-INDEPENDENT. The MMQ-fallback/dequant hypothesis is REFUTED. The nsys "MMQ at S=48 not
+S=8" was prefill caught in the slower run's profiling window (S=48 at 1.05 tg spends more wall-time
+in prefill during the fixed --delay), not a decode dispatch change; the shared decode MMVQ kernel
+only grew 1.3x per instance, nowhere near 4x.
+
+**Reconciled cost stack (what the S-swing is NOT):** not VRAM (27.8 GB < 32 at S=48), not the async
+machinery (async S8 3.85 > sync S8 3.49), not the slot kernel (flat 18 us), not the token-boundary
+host cost (that is INVERSE in S: 25 -> 6 ms). The residual 235 -> 946 ms non-boundary swing is a
+property of the two-path scheduler orchestration (GPU slot path + CPU skip path + per-layer
+cross-backend combine) interacting with hit rate - i.e. MORE GPU-resident experts is somehow slower
+at steady state, with the matmul itself proven cheap. Exact mechanism not positively isolated
+(candidate: cross-backend combine/critical-path serialization that shifts as the GPU path carries
+more of the 4 routed experts) - but it is INHERENT TO THE TWO-PATH DESIGN, which phase 3 removes.
+
+**Bearing on phase 3 (the reason this mattered):** phase 3's custom op computes resident experts
+against these same slot buffers. That substrate is now VERIFIED clean and S-independent, so phase 3
+does NOT inherit a kernel pathology, and its projected win (single path, no per-layer combine, elide
+the CPU op + its activation DtoH for fully-resident layers) rests on eliminating exactly the two-path
+orchestration that carries the residual S-swing. The phase-3 doc can be written against this stack.
