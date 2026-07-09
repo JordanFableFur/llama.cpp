@@ -95,8 +95,17 @@ without new evidence; full reasoning in EXPERIMENTS.md / SLOT-CACHE-DESIGN.md)
 1. **Tech report v1.0 + arXiv decision** — v0.2 needs the item-17 kill + entropy finding folded
    in and a narrative pass. Publication steps are human calls.
 2. **thecodacus outreach** — never sent; the story is now complete and strong.
-3. **MTP-over-offload bench** (GLM-4.5-Air, upstream `--mtp`, merged May 2026; gpt-oss has no
-   MTP heads) — cheap, practical, unpublished territory.
+3. **MTP-over-offload bench** (GLM-4.5-Air, upstream `--mtp`; gpt-oss has no MTP heads) — cheap,
+   practical, unpublished territory. **Partly set up 2026-07-09, then blocked:** GLM-4.5-Air
+   Q4_K_M downloaded (73 GB, `C:\Users\Jorda\models\GLM-4.5-Air-GGUF\`, MTP head present:
+   `blk.46.nextn.*`). `--spec-type draft-mtp` **aborts** at `src/models/glm4-moe.cpp:149` — the
+   graph's anti-multimodal guard (`ubatch.embd && !use_mrope`) misfires on the MTP/NextN draft's
+   legitimate embedding input (`llama_set_embeddings_nextn`, `common/speculative.cpp`). One-line
+   fix identified and committed **unbenched** on `experiments/glm-mtp-offload` (2f109eaad): add
+   `&& !cparams.embeddings_nextn` to the guard. **To resume:** cherry-pick/rebuild that fix,
+   verify temp-0 `--mtp` output is byte-identical to plain greedy (and plain path unchanged), then
+   bench `--mtp` on/off × ncmoe {best-fit, best-fit+4}, paired interleaved r≥8. Harness staged:
+   `mtp-bench.sh` (llama-server, per-request `predicted_per_second`) in the session scratchpad.
 4. **Replication on a second MoE family** (Qwen3-Next / GLM) — what turns the report into a
    paper; trace tooling ports directly.
 5. Parked: item 18 layout; large pages (blocked on SeLockMemoryPrivilege grant); upstream sync
