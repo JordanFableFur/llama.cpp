@@ -1540,6 +1540,7 @@ static void ggml_compute_forward_mul_mat_id(
     const struct ggml_tensor * ids = dst->src[2];
     const struct ggml_tensor * skip = dst->src[3]; // optional [n_expert] I8 skip mask (ggml_mul_mat_id_skip)
     const int8_t * skip_data = skip ? (const int8_t *) skip->data : NULL;
+    const struct ggml_tensor * capture = dst->src[4]; // optional [n_expert_used, >=n_tokens] I32 host: fused routing capture
 
     GGML_TENSOR_BINARY_OP_LOCALS
 
@@ -1634,6 +1635,21 @@ static void ggml_compute_forward_mul_mat_id(
 
                 MMID_MATRIX_ROW(i02, matrix_row_counts[i02]) = (struct mmid_row_mapping) {id, iid1};
                 matrix_row_counts[i02] += 1;
+            }
+        }
+
+        // fused routing capture (SLOT-CACHE-DESIGN P3.0): the routed ids are already in host
+        // memory as src[2]; copy them into the cache's host side-buffer while we hold them, as a
+        // side effect of the matmul this op already runs. No extra graph node, callback, or sync.
+        // Per-layer capture buffers are disjoint; the token boundary reads after graph completion.
+        if (capture) {
+            const int64_t n_tok = ids->ne[1] < capture->ne[1] ? ids->ne[1] : capture->ne[1];
+            int32_t * cap = (int32_t *) capture->data;
+            for (int64_t iid1 = 0; iid1 < n_tok; ++iid1) {
+                for (int id = 0; id < n_ids; ++id) {
+                    cap[iid1*capture->ne[0] + id] =
+                        *(const int32_t *) ((const char *) ids->data + iid1*ids->nb[1] + id*ids->nb[0]);
+                }
             }
         }
 

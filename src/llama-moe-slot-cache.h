@@ -43,8 +43,13 @@ struct llama_moe_slot_cache {
                                            // (pure allocation) - isolates allocation vs bookkeeping
     bool         promo_disabled = false;   // GGML_MOE_SLOT_NOPROMO: cpy-sink ON, update OFF -
                                            // isolates the graph cpy-sink cost from promotion
-    int          capture_mode = 0;         // routing capture: 0 = GPU-sink (default: GPU->GPU cpy +
-                                           // one batched D2H, no split, fast path preserved);
+    bool         cap_disabled = false;     // GGML_MOE_SLOT_NOCAP: two-path built, but fused capture
+                                           // AND update OFF - isolates two-path structural split cost
+                                           // from the capture (empty cache, no promotion) [P3.0 decomp]
+    int          capture_mode = 3;         // routing capture: 3 = fused into mul_mat_id_skip CPU forward
+                                           // (P3.0 default: op writes routed ids to ls.routed as a side
+                                           // effect - no graph node/callback/sync);
+                                           // 0 = GPU-sink (GGML_MOE_SLOT_GPUSINK, phase-2, diagnostic);
                                            // 1 = eval callback (GGML_MOE_SLOT_CALLBACK, diagnostic);
                                            // 2 = CPU cpy-sink (GGML_MOE_SLOT_CPYSINK, diagnostic)
     int          n_ubatch = 0;

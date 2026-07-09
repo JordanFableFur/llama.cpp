@@ -1448,7 +1448,8 @@ extern "C" {
             struct ggml_tensor  * as,
             struct ggml_tensor  * b,
             struct ggml_tensor  * ids,
-            struct ggml_tensor  * skip);
+            struct ggml_tensor  * skip,
+            struct ggml_tensor  * capture); // optional [n_expert_used, >=n_tokens] I32 host: fused routing capture
 
     // A: m columns, n rows,
     // B: p columns, n rows,

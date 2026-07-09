@@ -5,6 +5,8 @@
 //   (c) random   mask  -> plain result with skipped (token,k) columns zeroed
 //   (d) mutate the mask between evals of the SAME graph -> output tracks the new mask
 //       (catches any accidental caching of mask-derived state)
+//   (e) fused capture (src[4]) -> the op copies the routed ids into the capture buffer as a side
+//       effect, for every token, INDEPENDENT of the mask (skipped experts still capture) [P3.0]
 // The skip contract is self-contained: mask[e] != 0 means "skip expert e" (write zeros).
 
 #include "ggml.h"
@@ -40,10 +42,12 @@ int main() {
     ggml_tensor * b    = ggml_new_tensor_3d(ctx, GGML_TYPE_F32, K, U, T);
     ggml_tensor * ids  = ggml_new_tensor_2d(ctx, GGML_TYPE_I32, U, T);
     ggml_tensor * mask = ggml_new_tensor_1d(ctx, GGML_TYPE_I8,  E);
+    ggml_tensor * cap  = ggml_new_tensor_2d(ctx, GGML_TYPE_I32, U, T); // fused routing capture (src[4])
     ggml_set_input(as); ggml_set_input(b); ggml_set_input(ids); ggml_set_input(mask);
+    ggml_set_input(cap); // input so the allocator keeps it live; the op writes it as a side effect
 
     ggml_tensor * plain = ggml_mul_mat_id(ctx, as, b, ids);
-    ggml_tensor * skip  = ggml_mul_mat_id_skip(ctx, as, b, ids, mask);
+    ggml_tensor * skip  = ggml_mul_mat_id_skip(ctx, as, b, ids, mask, cap);
     ggml_set_output(plain); ggml_set_output(skip);
 
     ggml_backend_buffer_t buf = ggml_backend_alloc_ctx_tensors(ctx, backend);
@@ -106,6 +110,16 @@ int main() {
       run(m2); auto r2 = expect_masked(m2);
       bool t2 = memcmp(r2.data(), vs.data(), out_n*sizeof(float)) == 0;
       check("(d) mask-mutation tracks", t1 && t2); }
+
+    // (e) fused capture: poison the buffer, run with an ALL-ONE mask (every expert skipped), and
+    // confirm the op still wrote every token's routed ids into the capture buffer. Proves capture is
+    // a side effect of the op, independent of the skip mask (the token boundary reads this).
+    { std::vector<int32_t> poison(U*T, -777);
+      ggml_backend_tensor_set(cap, poison.data(), 0, U*T*sizeof(int32_t));
+      std::vector<int8_t> m(E, 1); run(m);
+      std::vector<int32_t> got(U*T);
+      ggml_backend_tensor_get(cap, got.data(), 0, U*T*sizeof(int32_t));
+      check("(e) fused-capture==ids", memcmp(got.data(), h_ids.data(), U*T*sizeof(int32_t)) == 0); }
 
     ggml_free(ctx);
     ggml_backend_free(backend);

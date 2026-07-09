@@ -28,9 +28,11 @@ std::unique_ptr<llama_moe_slot_cache> llama_moe_slot_cache::maybe_create_from_en
     cache->book_disabled    = getenv("GGML_MOE_SLOT_NOBOOK") != nullptr; // isolate allocation vs bookkeeping
     if (cache->book_disabled) { cache->compute_disabled = true; }        // NOBOOK implies no slot compute
     cache->promo_disabled   = getenv("GGML_MOE_SLOT_NOPROMO") != nullptr; // cpy-sink on, update off
+    cache->cap_disabled     = getenv("GGML_MOE_SLOT_NOCAP")   != nullptr; // two-path on, capture+update off
     if      (getenv("GGML_MOE_SLOT_CALLBACK")) { cache->capture_mode = 1; } // eval callback (diagnostic)
     else if (getenv("GGML_MOE_SLOT_CPYSINK"))  { cache->capture_mode = 2; } // CPU cpy-sink (diagnostic)
-    else                                       { cache->capture_mode = 0; } // GPU-sink (default)
+    else if (getenv("GGML_MOE_SLOT_GPUSINK"))  { cache->capture_mode = 0; } // GPU-sink (phase-2 default, diagnostic)
+    else                                       { cache->capture_mode = 3; } // fused into mul_mat_id_skip (P3.0, default)
     if (const char * r = getenv("GGML_MOE_SLOT_RING")) {
         const int rr = atoi(r);
         if (rr > 0) { cache->ring_size = rr; }

@@ -1972,17 +1972,22 @@ ggml_tensor * llm_graph_context::build_moe_ffn(
                 ggml_tensor * flat = ggml_reshape_1d(ctx0, selected_experts, neu*nt);
                 ggml_tensor * sid  = ggml_reshape_2d(ctx0, ggml_get_rows(ctx0, ls->e2s, flat), neu, nt);
                 ggml_tensor * gpu  = ggml_mul_mat_id(ctx0, slot, in, sid);
-                ggml_tensor * cpu  = ggml_mul_mat_id_skip(ctx0, w, in, selected_experts, ls->skip);
+                // fused routing capture (mode 3, P3.0): the gate's CPU skip-matmul already holds the
+                // routed ids on host; have it copy them into ls->routed as a side effect - no extra
+                // graph node. Only the gate captures (up/down route identically). book_disabled never
+                // reaches here (it forces compute_disabled), so this is a no-op under NOBOOK.
+                ggml_tensor * cap  = (moe_cache->capture_mode == 3 && w == ls->src_gate && !moe_cache->cap_disabled) ? ls->routed : nullptr;
+                ggml_tensor * cpu  = ggml_mul_mat_id_skip(ctx0, w, in, selected_experts, ls->skip, cap);
                 return ggml_add(ctx0, gpu, cpu);
             }
         }
         return build_lora_mm_id(w, in, selected_experts, w_s);
     };
 
-    // capture this layer's routed ids for the post-decode LRU/promotion update. Default (mode 0) is
-    // the GPU-sink: a GPU->GPU cpy to routed_gpu's z-slice (no graph split, fast path preserved),
-    // downloaded once per token. Mode 2 is the CPU cpy-sink (diagnostic). Mode 1 (callback) and
-    // book_disabled add no node here. Guarded on the used-expert count so warmup is skipped cleanly.
+    // capture this layer's routed ids for the post-decode LRU/promotion update. Default (mode 3) is
+    // fused into the gate mul_mat_id_skip above (no node here at all). Mode 0 (GPU-sink) is a GPU->GPU
+    // cpy to routed_gpu's z-slice; mode 2 is the CPU cpy-sink (diagnostic). Mode 1 (callback), mode 3
+    // (fused), and book_disabled add no node here. Guarded on used-expert count so warmup is skipped.
     if (moe_cache && !moe_cache->book_disabled &&
         (moe_cache->capture_mode == 0 || moe_cache->capture_mode == 2)) {
         const int pos = moe_cache->find_pos(il);
