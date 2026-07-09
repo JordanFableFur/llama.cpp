@@ -431,3 +431,41 @@ gated foundation; phase 2 is where it earns its tg. Do NOT ship phase 1 as a tg 
 promotion / get_rows-indirection primitives (tests/test-slot-matmul.cpp, test-mul-mat-id-skip.cpp),
 GGML_MOE_SLOT_CACHE end-to-end, GGML_MOE_CACHE_SIM. Phase 2 swaps the promotion path from sync to
 async; the compute/wiring/gates all carry forward.
+
+### Phase 2 spec addendum (Fable, 2026-07-08) — async promotion: design constraints and gates
+
+The new hazard class in phase 2 is **races between promotion copies and slot reads**. Pin these
+before writing code:
+
+1. **Token-boundary event polling, not stream-wait gymnastics.** Promotions run on a dedicated
+   copy stream, each with a CUDA event recorded at completion. At each token boundary the host
+   polls events (cudaEventQuery, non-blocking): only for COMPLETED promotions does it update the
+   host LRU/e2s/skip-mask and enqueue the 512-byte e2s upload — on the DECODE stream, so stream
+   order guarantees every subsequent get_rows sees the new map only after the slot bytes landed.
+   An in-flight promotion is invisible: costs one extra miss, never a wrong read. No
+   cudaStreamWaitEvent needed on the decode stream at all.
+2. **Victim safety:** the LRU victim being overwritten must not be readable by in-flight compute.
+   With map updates deferred to token boundaries this holds by construction (the old occupant's
+   e2s entry flips to dummy in the same boundary update BEFORE the promotion into that slot is
+   enqueued — enforce this ordering: demote first, promote after).
+3. **Staging ring (finding 3, mandatory):** promotions must NOT cudaMemcpyAsync directly from
+   mmap'd weights — shard-3 experts are unpinned (pageable copies serialize the copy stream) and
+   direct copies risk the one-registered-region rule. Route every promotion: host memcpy expert
+   rows -> pinned ring slot (cudaHostAlloc, 2 x 16 MB, double-buffered) -> cudaMemcpyAsync ring ->
+   slot on the copy stream. The ring is allocated by the cache object (NOT registered mmap pages),
+   so the straddle landmine does not apply. Unit-test the ring standalone first (byte-compare a
+   promoted slot, both ring slots cycling).
+4. **Promotion budget:** cap promotions at N/token (start N=2-4, make it a knob). Unbounded
+   promotion during warmup floods the ring and the copy stream; the LRU converges anyway via
+   repeated routing. Record warmup length (tokens to steady-state hit rate) as a reported metric.
+5. **Carry-forward gates (re-run, not assumed):** forced-empty byte gate and M5b unit oracle must
+   still pass after the async swap; ppl-within-noise and hit-rate-matches-sim re-verified.
+6. **New performance gates:** (a) nsys trace shows promotions on the copy stream and NO per-token
+   host sync on the decode stream (the 36 cpy-sink ids syncs from phase 1 remain — they are the
+   status-quo cost, but no NEW syncs); (b) **equal-VRAM verdict (finding 1)**: best cache config
+   (ncmoe ~26-28 + slots) vs best static config (ncmoe 22) at equal total VRAM, tg, clean box,
+   r>=5 — this is THE ship/no-ship number; (c) p99 inter-token latency not worse than static
+   baseline; (d) warmup: time-to-steady-state reported.
+7. **Pause points for the supervised run:** (i) after the staging ring + its unit test, before
+   wiring into promotion; (ii) after first nsys trace, before the full bench matrix; (iii) final
+   numbers before any BENCHMARKS.md/README claim.
