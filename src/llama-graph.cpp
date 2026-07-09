@@ -16,11 +16,99 @@
 
 #include <cassert>
 #include <cmath>
+#include <cstdio>
+#include <cstdlib>
 #include <cstring>
+#include <mutex>
 #include <numeric>
 #include <sstream>
 #include <string>
 #include <unordered_set>
+#include <vector>
+
+// ---------------------------------------------------------------------------
+// GGML_MOE_DRAFT_SIM (diagnostic, EXPERIMENTS.md item 17 gate b): restrict each MoE layer's
+// routing to the experts a simulated per-layer LRU cache holds resident, then let the model's
+// existing top-k + weight-softmax renormalize over that resident set. The resident set per
+// (sequence-position, layer) is precomputed offline from a true routing trace (build-draft-masks.py)
+// so the forward stays stateless. Env GGML_MOE_DRAFT_SIM=<maskfile>. An all-resident mask makes the
+// injected bias identically zero -> byte-identical to baseline (the validation gate). This is a
+// measurement hook only: it changes routing to price draft-vs-true token agreement; nothing here is
+// a speculation engine.
+//
+// Mask file format (little-endian):
+//   int32 magic 'MDSK' (0x4b53444d), int32 n_layer, int32 n_token, int32 n_expert
+//   payload: for pos in [0,n_token): for L in [0,n_layer): uint8[ceil(n_expert/8)] resident bitmask
+//            (bit e set => expert e is resident for that position+layer; all-set => no masking)
+namespace {
+struct moe_draft_sim_state {
+    bool                 loaded  = false;
+    bool                 enabled = false;
+    int32_t              n_layer = 0, n_token = 0, n_expert = 0;
+    int32_t              bytes_per = 0;  // ceil(n_expert/8)
+    std::vector<uint8_t> data;
+
+    void ensure_loaded() {
+        static std::once_flag once;
+        std::call_once(once, [this]() {
+            loaded = true;
+            const char * path = getenv("GGML_MOE_DRAFT_SIM");
+            if (!path || !*path) { return; }
+            FILE * f = fopen(path, "rb");
+            if (!f) { fprintf(stderr, "moe_draft_sim: cannot open %s\n", path); return; }
+            int32_t hdr[4] = {0,0,0,0};
+            if (fread(hdr, sizeof(int32_t), 4, f) != 4 || hdr[0] != 0x4b53444d) {
+                fprintf(stderr, "moe_draft_sim: bad header in %s\n", path); fclose(f); return;
+            }
+            n_layer = hdr[1]; n_token = hdr[2]; n_expert = hdr[3];
+            bytes_per = (n_expert + 7) / 8;
+            const size_t n = (size_t) n_token * n_layer * bytes_per;
+            data.resize(n);
+            const size_t got = fread(data.data(), 1, n, f);
+            fclose(f);
+            if (got != n) { fprintf(stderr, "moe_draft_sim: short read (%zu/%zu) in %s\n", got, n, path); return; }
+            enabled = true;
+            fprintf(stderr, "moe_draft_sim: loaded %s (n_layer=%d n_token=%d n_expert=%d)\n",
+                    path, n_layer, n_token, n_expert);
+        });
+    }
+
+    bool is_enabled() { ensure_loaded(); return enabled; }
+
+    // fill bias[e, i] = 0 if expert e resident for (pos_i, il) else -INF. Out-of-range pos or layer
+    // and not-warm rows are encoded upstream as all-resident (bias 0), so this is a pure lookup.
+    void fill_bias(float * bias, int il, const llama_pos * pos, int64_t nt, int64_t ne) {
+        for (int64_t i = 0; i < nt; ++i) {
+            float * row = bias + i * ne;
+            const int32_t p = (int32_t) pos[i];
+            const uint8_t * mask = nullptr;
+            if (enabled && p >= 0 && p < n_token && il >= 0 && il < n_layer) {
+                mask = data.data() + ((size_t) p * n_layer + il) * bytes_per;
+            }
+            for (int64_t e = 0; e < ne; ++e) {
+                const bool resident = !mask || (mask[e >> 3] & (1u << (e & 7)));
+                row[e] = resident ? 0.0f : -INFINITY;
+            }
+        }
+    }
+};
+moe_draft_sim_state g_moe_draft_sim;
+} // namespace
+
+class llm_graph_input_moe_draft_bias : public llm_graph_input_i {
+public:
+    llm_graph_input_moe_draft_bias(int il, int64_t n_expert) : il(il), n_expert(n_expert) {}
+    void set_input(const llama_ubatch * ubatch) override {
+        if (!bias) { return; }
+        const int64_t nt = ubatch->n_tokens;
+        std::vector<float> buf((size_t) n_expert * nt);
+        g_moe_draft_sim.fill_bias(buf.data(), il, ubatch->pos, nt, n_expert);
+        ggml_backend_tensor_set(bias, buf.data(), 0, buf.size() * sizeof(float));
+    }
+    ggml_tensor * bias = nullptr;
+    int     il;
+    int64_t n_expert;
+};
 
 // dedup helpers
 
@@ -1888,6 +1976,21 @@ ggml_tensor * llm_graph_context::build_moe_ffn(
         selection_probs = ggml_set_rows(ctx0, ggml_fill(ctx0, selection_groups, -INFINITY), selection_probs, expert_groups); // [n_exp_per_group, n_expert_groups, n_tokens]
         selection_probs = ggml_reshape_2d(ctx0, selection_probs, n_expert, n_tokens); // [n_expert, n_tokens]
         cb(selection_probs, "ffn_moe_probs_masked", il);
+    }
+
+    // GGML_MOE_DRAFT_SIM (item 17 gate b, diagnostic): add a per-(position,layer) bias that is 0 on
+    // resident experts and -inf on non-resident, so the top-k below selects only from the resident
+    // set and the downstream weight-softmax renormalizes over it. All-resident mask => bias 0 =>
+    // byte-identical to baseline. Only active when selecting fresh top-k here (not for injected ids).
+    if (selected_experts_in == nullptr && g_moe_draft_sim.is_enabled() && n_tokens > 0) {
+        auto inp = std::make_unique<llm_graph_input_moe_draft_bias>(il, n_expert);
+        ggml_tensor * bias = ggml_new_tensor_2d(ctx0, GGML_TYPE_F32, n_expert, n_tokens);
+        ggml_set_input(bias);
+        cb(bias, "ffn_moe_draft_bias", il);
+        inp->bias = bias;
+        res->add_input(std::move(inp));
+        selection_probs = ggml_add(ctx0, selection_probs, bias);
+        cb(selection_probs, "ffn_moe_probs_draftmask", il);
     }
 
     // select experts
