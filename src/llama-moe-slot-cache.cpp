@@ -7,6 +7,7 @@
 #include "ggml-alloc.h"
 
 #include <algorithm>
+#include <chrono>
 #include <cstdio>
 #include <cstdlib>
 #include <cstring>
@@ -64,6 +65,10 @@ llama_moe_slot_cache::~llama_moe_slot_cache() {
                 "%s, %llu promotions) ===\n",
                 100.0 * (double) hits / (double) reqs, (unsigned long long) hits, (unsigned long long) reqs,
                 n_slots, async_promote ? "async" : "sync", (unsigned long long) promotions);
+        if (update_calls > 0) {
+            fprintf(stderr, "=== MoE slot cache: token-boundary host cost avg %.3f ms/call (%llu calls) ===\n",
+                    (double) update_ns / (double) update_calls / 1e6, (unsigned long long) update_calls);
+        }
         fflush(stderr);
     }
 }
@@ -265,6 +270,7 @@ void llama_moe_slot_cache::update_after_decode(int n_tokens) {
     if (!initialized || layers.empty()) {
         return;
     }
+    const auto t_begin = std::chrono::steady_clock::now();
     if (async_promote) {
         poll_completions(); // land finished promotions first (frees rings, publishes maps)
     }
@@ -326,4 +332,7 @@ void llama_moe_slot_cache::update_after_decode(int n_tokens) {
         }
         if (!async_promote && sync_dirty) { upload_maps(ls); }
     }
+    update_ns += (uint64_t) std::chrono::duration_cast<std::chrono::nanoseconds>(
+                     std::chrono::steady_clock::now() - t_begin).count();
+    update_calls++;
 }

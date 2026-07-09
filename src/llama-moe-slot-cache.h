@@ -28,6 +28,10 @@ struct llama_moe_slot_cache {
     uint64_t reqs = 0;
     uint64_t promotions = 0;
 
+    // token-boundary host-cost telemetry (poll + ring memcpy + publish), reported at teardown
+    uint64_t update_ns    = 0;
+    uint64_t update_calls = 0;
+
     // phase-2 async promotion: dedicated copy stream + pinned staging ring (SLOT-CACHE-DESIGN.md
     // phase-2 addendum). Promotions run off the decode stream; the compute map (e2s/skip) is only
     // updated once event_query confirms the copy landed. Off => promote() synchronous (phase 1).
