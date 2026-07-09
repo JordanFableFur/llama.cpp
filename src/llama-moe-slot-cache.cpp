@@ -6,6 +6,7 @@
 #include "ggml-backend.h"
 #include "ggml-alloc.h"
 
+#include <algorithm>
 #include <cstdio>
 #include <cstdlib>
 #include <cstring>
@@ -20,8 +21,15 @@ std::unique_ptr<llama_moe_slot_cache> llama_moe_slot_cache::maybe_create_from_en
     if (s <= 0) {
         return nullptr;
     }
-    LLAMA_LOG_INFO("%s: MoE slot cache enabled, %d slots/layer\n", __func__, s);
-    return std::make_unique<llama_moe_slot_cache>(s);
+    auto cache = std::make_unique<llama_moe_slot_cache>(s);
+    cache->async_promote = getenv("GGML_MOE_SLOT_SYNC") == nullptr; // async (phase 2) default; SYNC=1 => phase 1
+    if (const char * b = getenv("GGML_MOE_SLOT_BUDGET")) {
+        const int bb = atoi(b);
+        if (bb > 0) { cache->promote_budget = bb; }
+    }
+    LLAMA_LOG_INFO("%s: MoE slot cache enabled, %d slots/layer, promotion=%s, budget=%d\n",
+                   __func__, s, cache->async_promote ? "async" : "sync", cache->promote_budget);
+    return cache;
 }
 
 void llama_moe_slot_cache::promote(layer_slots & ls, int expert_id, int slot) {
@@ -35,10 +43,22 @@ void llama_moe_slot_cache::promote(layer_slots & ls, int expert_id, int slot) {
 }
 
 llama_moe_slot_cache::~llama_moe_slot_cache() {
+    if (copy_backend) {
+        ggml_backend_synchronize(copy_backend);
+    }
+    for (int r = 0; r < 2; ++r) {
+        if (ring[r].evt) { ggml_backend_event_free(ring[r].evt); }
+        if (ring[r].buf) { ggml_backend_buffer_free(ring[r].buf); }
+    }
+    if (copy_backend) {
+        ggml_backend_free(copy_backend);
+    }
     if (reqs > 0) {
         // teardown runs after the log backend is gone; write straight to stderr
-        fprintf(stderr, "\n=== MoE slot cache: online hit rate %.1f%% (%llu/%llu requests, %d slots/layer) ===\n",
-                100.0 * (double) hits / (double) reqs, (unsigned long long) hits, (unsigned long long) reqs, n_slots);
+        fprintf(stderr, "\n=== MoE slot cache: online hit rate %.1f%% (%llu/%llu requests, %d slots/layer, "
+                "%s, %llu promotions) ===\n",
+                100.0 * (double) hits / (double) reqs, (unsigned long long) hits, (unsigned long long) reqs,
+                n_slots, async_promote ? "async" : "sync", (unsigned long long) promotions);
         fflush(stderr);
     }
 }
@@ -141,11 +161,41 @@ void llama_moe_slot_cache::init(const llama_model & model, int n_expert_used_, i
         std::vector<int8_t> zeros(n_expert, 0);
         for (auto & ls : layers) {
             ls.skip_host.assign(n_expert, 0);
+            ls.slot_of.assign(n_expert, -1);
             ls.mru.clear();
             ggml_backend_tensor_set(ls.skip, zeros.data(), 0, ggml_nbytes(ls.skip)); // empty: skip nothing
         }
         ctxs.emplace_back(ctx_cpu);
         bufs.emplace_back(buf_cpu);
+    }
+
+    // phase-2: dedicated copy stream (separate backend instance) + pinned staging ring
+    if (async_promote && !layers.empty()) {
+        ggml_backend_dev_t dev = model.dev_layer(layers[0].il);
+        ggml_backend_buffer_type_t host_buft = ggml_backend_dev_host_buffer_type(dev);
+        if (!host_buft) {
+            LLAMA_LOG_WARN("%s: no pinned host buffer type; using synchronous promotion\n", __func__);
+            async_promote = false;
+        } else {
+            copy_backend = ggml_backend_dev_init(dev, nullptr);
+            size_t ring_bytes = 0;
+            for (auto & ls : layers) {
+                ring_bytes = std::max(ring_bytes, ls.src_gate->nb[2] + ls.src_up->nb[2] + ls.src_down->nb[2]);
+            }
+            for (int r = 0; r < 2; ++r) {
+                ring[r].buf  = ggml_backend_buft_alloc_buffer(host_buft, ring_bytes);
+                ring[r].ptr  = ring[r].buf ? ggml_backend_buffer_get_base(ring[r].buf) : nullptr;
+                ring[r].evt  = ggml_backend_event_new(dev);
+                ring[r].busy = false;
+            }
+            if (!copy_backend || !ring[0].ptr || !ring[1].ptr || !ring[0].evt || !ring[1].evt) {
+                LLAMA_LOG_WARN("%s: async promotion setup failed; using synchronous promotion\n", __func__);
+                async_promote = false;
+            } else {
+                LLAMA_LOG_INFO("%s: async promotion: dedicated copy stream + 2 x %.1f MiB pinned ring\n",
+                               __func__, ring_bytes / (1024.0 * 1024.0));
+            }
+        }
     }
 
     LLAMA_LOG_INFO("%s: cached %zu CPU-resident MoE layers, %d(+1) slots each, %.1f MiB VRAM\n",
@@ -164,13 +214,66 @@ void llama_moe_slot_cache::init(const llama_model & model, int n_expert_used_, i
     }
 }
 
+void llama_moe_slot_cache::upload_maps(layer_slots & ls) {
+    ggml_backend_tensor_set(ls.e2s,  ls.e2s_host.data(),  0, ggml_nbytes(ls.e2s));
+    ggml_backend_tensor_set(ls.skip, ls.skip_host.data(), 0, ggml_nbytes(ls.skip));
+}
+
+void llama_moe_slot_cache::promote_async(int layer_idx, int expert, int slot) {
+    int r = -1;
+    for (int i = 0; i < 2; ++i) { if (!ring[i].busy) { r = i; break; } }
+    if (r < 0) { return; }
+
+    layer_slots & ls = layers[layer_idx];
+    char * base = (char *) ring[r].ptr;
+    const size_t g = ls.src_gate->nb[2], u = ls.src_up->nb[2], d = ls.src_down->nb[2];
+    // stage the expert's gate/up/down slices contiguously in the pinned ring buffer
+    memcpy(base,         (const char *) ls.src_gate->data + (size_t) expert * g, g);
+    memcpy(base + g,     (const char *) ls.src_up->data   + (size_t) expert * u, u);
+    memcpy(base + g + u, (const char *) ls.src_down->data + (size_t) expert * d, d);
+    // async copy pinned ring -> GPU slots on the dedicated copy stream
+    ggml_backend_tensor_set_async(copy_backend, ls.gate, base,         (size_t) slot * g, g);
+    ggml_backend_tensor_set_async(copy_backend, ls.up,   base + g,     (size_t) slot * u, u);
+    ggml_backend_tensor_set_async(copy_backend, ls.down, base + g + u, (size_t) slot * d, d);
+    ggml_backend_event_record(ring[r].evt, copy_backend);
+    ring[r].busy = true; ring[r].layer_idx = layer_idx; ring[r].expert = expert; ring[r].slot = slot;
+    promotions++;
+}
+
+void llama_moe_slot_cache::poll_completions() {
+    for (int i = 0; i < 2; ++i) {
+        if (!ring[i].busy) { continue; }
+        if (!ggml_backend_event_query(ring[i].evt)) { continue; } // copy still in flight
+        layer_slots & ls = layers[ring[i].layer_idx];
+        ls.e2s_host[ring[i].expert]  = ring[i].slot; // now compute-resident (bytes have landed)
+        ls.skip_host[ring[i].expert] = 1;
+        upload_maps(ls);
+        ring[i].busy = false;
+    }
+}
+
 void llama_moe_slot_cache::update_after_decode(int n_tokens) {
     if (!initialized || layers.empty()) {
         return;
     }
-    for (auto & ls : layers) {
+    if (async_promote) {
+        poll_completions(); // land finished promotions first (frees rings, publishes maps)
+    }
+
+    auto touch = [](layer_slots & ls, int e) {
+        for (size_t i = 0; i < ls.mru.size(); ++i) {
+            if (ls.mru[i] == e) {
+                if (i != 0) { ls.mru.erase(ls.mru.begin() + i); ls.mru.insert(ls.mru.begin(), e); }
+                return;
+            }
+        }
+    };
+
+    for (int li = 0; li < (int) layers.size(); ++li) {
+        layer_slots & ls = layers[li];
         const int32_t * routed = (const int32_t *) ls.routed->data; // [n_expert_used, n_ubatch]
-        bool dirty = false;
+        bool sync_dirty = false;
+        int budget = promote_budget;
         for (int t = 0; t < n_tokens; ++t) {
             for (int k = 0; k < n_expert_used; ++k) {
                 const int e = routed[k + t*n_expert_used];
@@ -178,38 +281,38 @@ void llama_moe_slot_cache::update_after_decode(int n_tokens) {
                     continue;
                 }
                 reqs++;
-                if (ls.e2s_host[e] != n_slots) {
-                    // resident (was GPU-computed this token): a hit; refresh recency
-                    hits++;
-                    for (size_t i = 0; i < ls.mru.size(); ++i) {
-                        if (ls.mru[i] == e) {
-                            if (i != 0) { ls.mru.erase(ls.mru.begin() + i); ls.mru.insert(ls.mru.begin(), e); }
-                            break;
-                        }
+                if (ls.e2s_host[e] != n_slots) { hits++; touch(ls, e); continue; } // resident (landed)
+                if (ls.slot_of[e]  != -1)      {         touch(ls, e); continue; } // in-flight: slot reserved
+
+                // genuine miss with no slot assigned -> maybe promote
+                if (!async_promote) {
+                    int slot;
+                    if ((int) ls.mru.size() < n_slots) { slot = (int) ls.mru.size(); }
+                    else {
+                        const int v = ls.mru.back(); ls.mru.pop_back();
+                        slot = ls.slot_of[v]; ls.slot_of[v] = -1; ls.e2s_host[v] = n_slots; ls.skip_host[v] = 0;
                     }
-                    continue;
-                }
-                // miss: pick a slot (next free while warming, else evict the LRU expert), promote
-                int slot;
-                if ((int) ls.mru.size() < n_slots) {
-                    slot = (int) ls.mru.size();
+                    promote(ls, e, slot);
+                    ls.slot_of[e] = slot; ls.e2s_host[e] = slot; ls.skip_host[e] = 1;
+                    ls.mru.insert(ls.mru.begin(), e);
+                    promotions++; sync_dirty = true;
                 } else {
-                    const int victim = ls.mru.back();
-                    ls.mru.pop_back();
-                    slot = ls.e2s_host[victim];
-                    ls.e2s_host[victim]  = n_slots;
-                    ls.skip_host[victim] = 0;
+                    if (budget <= 0) { continue; }
+                    if (ring[0].busy && ring[1].busy) { continue; } // no staging buffer free; promote later
+                    int slot; bool demoted = false;
+                    if ((int) ls.mru.size() < n_slots) { slot = (int) ls.mru.size(); }
+                    else {
+                        const int v = ls.mru.back(); ls.mru.pop_back();
+                        slot = ls.slot_of[v]; ls.slot_of[v] = -1; ls.e2s_host[v] = n_slots; ls.skip_host[v] = 0;
+                        demoted = true;
+                    }
+                    ls.slot_of[e] = slot; ls.mru.insert(ls.mru.begin(), e); // reserve; e2s stays dummy until landed
+                    if (demoted) { upload_maps(ls); } // demote-first: victim -> dummy visible BEFORE the copy
+                    promote_async(li, e, slot);
+                    budget--;
                 }
-                promote(ls, e, slot);
-                ls.e2s_host[e]  = slot;
-                ls.skip_host[e] = 1;
-                ls.mru.insert(ls.mru.begin(), e);
-                dirty = true;
             }
         }
-        if (dirty) {
-            ggml_backend_tensor_set(ls.e2s,  ls.e2s_host.data(),  0, ggml_nbytes(ls.e2s));
-            ggml_backend_tensor_set(ls.skip, ls.skip_host.data(), 0, ggml_nbytes(ls.skip));
-        }
+        if (!async_promote && sync_dirty) { upload_maps(ls); }
     }
 }

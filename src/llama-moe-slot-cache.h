@@ -2,6 +2,7 @@
 
 #include "ggml.h"
 #include "ggml-cpp.h"
+#include "ggml-backend.h"
 
 #include <cstdint>
 #include <memory>
@@ -25,6 +26,24 @@ struct llama_moe_slot_cache {
     // online hit accounting (compute-relevant: residency at access time); reported at teardown
     uint64_t hits = 0;
     uint64_t reqs = 0;
+    uint64_t promotions = 0;
+
+    // phase-2 async promotion: dedicated copy stream + pinned staging ring (SLOT-CACHE-DESIGN.md
+    // phase-2 addendum). Promotions run off the decode stream; the compute map (e2s/skip) is only
+    // updated once event_query confirms the copy landed. Off => promote() synchronous (phase 1).
+    bool         async_promote  = false;
+    int          promote_budget = 4;     // max promotions ENQUEUED per token (knob)
+    ggml_backend_t copy_backend = nullptr;
+
+    struct ring_slot {
+        ggml_backend_buffer_t buf = nullptr;
+        void *                ptr = nullptr;
+        ggml_backend_event_t  evt = nullptr;
+        bool busy = false;
+        // deferred map update applied when evt completes:
+        int layer_idx = -1, expert = -1, slot = -1;
+    };
+    ring_slot ring[2];
 
     // one entry per CPU-resident MoE layer; GPU tensors live in the owned bufs below
     struct layer_slots {
@@ -42,9 +61,12 @@ struct llama_moe_slot_cache {
         ggml_tensor * src_up   = nullptr;
         ggml_tensor * src_down = nullptr;
 
-        std::vector<int32_t> e2s_host;   // host mirror of e2s: expert -> slot (n_slots = not resident)
-        std::vector<int8_t>  skip_host;  // host mirror of skip: 1 = resident
-        std::vector<int32_t> mru;        // resident experts, front = most-recently-used (LRU eviction from back)
+        std::vector<int32_t> e2s_host;   // GPU-visible compute map: expert -> slot; only updated when
+                                         // a promotion COMPLETES (n_slots = not resident / in-flight)
+        std::vector<int8_t>  skip_host;  // host mirror of skip: 1 = resident (completed)
+        std::vector<int32_t> mru;        // experts OCCUPYING a slot (in-flight or completed), front = MRU
+        std::vector<int32_t> slot_of;    // expert -> assigned slot (bookkeeping), -1 if none. Differs from
+                                         // e2s_host only for in-flight promotions (assigned but not landed)
     };
 
     std::vector<layer_slots>             layers;
@@ -74,4 +96,9 @@ struct llama_moe_slot_cache {
 
     // synchronous promotion: copy expert_id's weights into slot on the GPU (phase 1)
     void promote(layer_slots & ls, int expert_id, int slot);
+
+    // phase-2 async promotion helpers
+    void promote_async(int layer_idx, int expert_id, int slot); // stage via ring, async copy, record event
+    void poll_completions();                                    // apply map updates for finished promotions
+    void upload_maps(layer_slots & ls);                         // sync-upload e2s + skip for one layer
 };
