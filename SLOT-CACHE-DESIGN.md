@@ -801,3 +801,40 @@ loses to the champion even working perfectly. Amendments:
    all-off control (two-path with NO capture); every mechanism verdict inherited the two-path
    collapse. Standing rule: an A/B over mechanisms is uninterpretable without the
    everything-off cell measured on the same substrate.
+
+### P3.1 pre-measurements DONE (2026-07-09), `experiments/slot-cache` (d24a8320c). Both GO. No implementation.
+Measured with existing toggles only — no new code. Logs in scratchpad (p3a-*, p3b-*).
+
+**3(a) — uncontaminated elided-layer capture cost.** Batched GPU-sink capture on the PLAIN
+substrate (no two-path): `GGML_MOE_SLOT_CACHE=8 NOSLOT=1 GPUSINK=1 NOPROMO=1` (plain compute path,
+GPU-sink cpy nodes built, capture-only). tg128 ncmoe36 = **18.02 ± 4.62 ≈ NOBOOK 19.15** — capture
+is FREE once off the two-path. Capture-fired confirmation (same config, update ON): online hit rate
+**64.7%** — sensible/non-degenerate, proving the GPU-sink nodes wrote correct routing ids on the
+clean substrate (a zeroed routed_gpu would give a degenerate rate). The phase-2 "GPU-sink 5.2 tg"
+was entirely two-path contamination. **Verdict: elided-layer capture SOLVED** (amendment rule:
+tg ≈ NOBOOK → solved). Caveat: the one boundary D2H is excluded by NOPROMO, but it is a single
+post-compute copy/token, not a pipeline-breaking in-graph node — the in-graph cpy nodes are what
+3(a) measures and they are free.
+
+**3(b) — graph-reuse loss.** `LLAMA_GRAPH_REUSE_DISABLE=1` (per-token rebuild) vs default (reuse),
+no cache. Reuse mechanism confirmed active and the knob fires: llama-completion `graphs reused`
+**126/127 → 0**. Magnitude is BELOW the box noise floor in every regime measured:
+
+| tg128 (no cache) | reuse ON | reuse OFF | Δ (ON−OFF) |
+|---|---|---|---|
+| ncmoe36 bench -r3 | 18.63 ± 5.35 | 18.06 ± 4.41 | +0.57 |
+| ncmoe36 bench -r10 | 23.21 ± 3.63 | 21.88 ± 3.48 | +1.33 (ON faster) |
+| ncmoe36 completion ms/tok | 72.97 | 62.73 | OFF faster |
+| ncmoe24 bench -r10 | 31.55 ± 5.21 | 31.00 ± 5.29 | +0.55 (ON faster) |
+
+The ON/OFF delta is smaller than the error bars everywhere, its **sign is inconsistent** across
+tools/configs, and same-config mean drift (ncmoe36 ON 18.6 → 23.2 across runs) exceeds any delta.
+The box's per-token variance (±16%, intrinsic to the 162 GB/token expert DtoH) swamps the fixed
+graph-rebuild host cost. **Bound: reuse tax ≲ 0.5–1.3 tg (~0.5–2.7 ms/token), sign indeterminate —
+a small fixed host cost, far below P3.1's projected elision savings (tens of ms/token).** A precise
+figure would need in-process instrumentation (out of scope for a pre-measurement). **Verdict: reuse
+loss does NOT exceed projected elision savings → GO** (amendment stop condition not triggered).
+
+**Both pre-measurements GO.** The two unknowns in the amendment's cost model are now bounded:
+elided capture is free (3a), reuse tax is negligible (3b). Neither stop condition fires. Awaiting
+review before any P3.1 implementation.
