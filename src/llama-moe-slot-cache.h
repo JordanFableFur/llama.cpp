@@ -43,6 +43,8 @@ struct llama_moe_slot_cache {
                                            // (pure allocation) - isolates allocation vs bookkeeping
     bool         promo_disabled = false;   // GGML_MOE_SLOT_NOPROMO: cpy-sink ON, update OFF -
                                            // isolates the graph cpy-sink cost from promotion
+    bool         use_cpysink = false;      // GGML_MOE_SLOT_CPYSINK: route capture via a graph cpy
+                                           // node (old path) instead of the eval callback (A/B)
     int          ring_size      = 32;    // pinned staging buffers = max promotions in flight (knob)
     int          promote_budget = 32;    // max promotions ENQUEUED per token, GLOBAL across layers (knob)
     ggml_backend_t copy_backend = nullptr;
@@ -92,6 +94,11 @@ struct llama_moe_slot_cache {
 
     // lazily allocate slot buffers for every CPU-resident MoE layer of the model (idempotent)
     void init(const llama_model & model, int n_expert_used, int n_ubatch);
+
+    // eval-callback routing capture (replaces the graph cpy-sink): CAPTURE ONLY - copies the routed
+    // ids of each cached layer's gate mul_mat_id into ls.routed; mutates no LRU/map/mask state (all
+    // deferred to update_after_decode at the token boundary). Returns, on ask, whether to observe t.
+    bool eval_capture(struct ggml_tensor * t, bool ask);
 
     // after a decode, promote each layer's routed misses into slots (LRU) and upload the maps
     void update_after_decode(int n_tokens);

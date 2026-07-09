@@ -1981,7 +1981,7 @@ ggml_tensor * llm_graph_context::build_moe_ffn(
 
     // capture this layer's routed ids into the cache's CPU sink for the post-decode LRU/promotion
     // update. Guarded on the used-expert count so warmup (ne[0]=n_expert) is skipped cleanly.
-    if (moe_cache && !moe_cache->book_disabled) {
+    if (moe_cache && !moe_cache->book_disabled && moe_cache->use_cpysink) {
         const llama_moe_slot_cache::layer_slots * ls = moe_cache->find(il);
         if (ls && ls->routed && selected_experts->ne[0] == ls->routed->ne[0] &&
             selected_experts->ne[1] <= ls->routed->ne[1]) {

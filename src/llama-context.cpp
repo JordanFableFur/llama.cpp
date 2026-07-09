@@ -1303,6 +1303,21 @@ bool llama_context::set_adapter_cvec(
     return res;
 }
 
+static bool llama_moe_eval_mux_cb(struct ggml_tensor * t, bool ask, void * user_data) {
+    auto * m = (llama_moe_eval_mux_t *) user_data;
+    bool want = false;
+    if (m->cache) {
+        if (ask) { want = m->cache->eval_capture(t, true); }
+        else     {        m->cache->eval_capture(t, false); }
+    }
+    if (m->tool_cb) {
+        const bool tw = m->tool_cb(t, ask, m->tool_ud);
+        if (ask) { want = want || tw; }
+        else     { return tw; } // preserve any tool callback's break semantics
+    }
+    return ask ? want : true;
+}
+
 llm_graph_result * llama_context::process_ubatch(const llama_ubatch & ubatch, llm_graph_type gtype, llama_memory_context_i * mctx, ggml_status & ret) {
     if (mctx && !mctx->apply()) {
         LLAMA_LOG_ERROR("%s: failed to apply memory context\n", __func__);
@@ -1332,7 +1347,15 @@ llm_graph_result * llama_context::process_ubatch(const llama_ubatch & ubatch, ll
         res->reset();
 
         ggml_backend_sched_reset(sched.get());
-        ggml_backend_sched_set_eval_callback(sched.get(), cparams.cb_eval, cparams.cb_eval_user_data);
+        if (moe_cache && !moe_cache->book_disabled && !moe_cache->use_cpysink) {
+            // route capture through the eval callback (no graph cpy-sink); mux with any tool callback
+            moe_eval_mux.tool_cb = cparams.cb_eval;
+            moe_eval_mux.tool_ud = cparams.cb_eval_user_data;
+            moe_eval_mux.cache   = moe_cache.get();
+            ggml_backend_sched_set_eval_callback(sched.get(), llama_moe_eval_mux_cb, &moe_eval_mux);
+        } else {
+            ggml_backend_sched_set_eval_callback(sched.get(), cparams.cb_eval, cparams.cb_eval_user_data);
+        }
 
         //const auto t_start_us = ggml_time_us();
 

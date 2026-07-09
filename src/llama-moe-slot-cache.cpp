@@ -28,6 +28,7 @@ std::unique_ptr<llama_moe_slot_cache> llama_moe_slot_cache::maybe_create_from_en
     cache->book_disabled    = getenv("GGML_MOE_SLOT_NOBOOK") != nullptr; // isolate allocation vs bookkeeping
     if (cache->book_disabled) { cache->compute_disabled = true; }        // NOBOOK implies no slot compute
     cache->promo_disabled   = getenv("GGML_MOE_SLOT_NOPROMO") != nullptr; // cpy-sink on, update off
+    cache->use_cpysink      = getenv("GGML_MOE_SLOT_CPYSINK") != nullptr; // A/B: graph cpy-sink vs callback
     if (const char * r = getenv("GGML_MOE_SLOT_RING")) {
         const int rr = atoi(r);
         if (rr > 0) { cache->ring_size = rr; }
@@ -268,6 +269,29 @@ void llama_moe_slot_cache::poll_completions() {
         upload_maps(ls);
         rs.busy = false;
     }
+}
+
+bool llama_moe_slot_cache::eval_capture(struct ggml_tensor * t, bool ask) {
+    const ggml_tensor * src0 = t->src[0];
+    if (ask) {
+        // observe the gate mul_mat_id of cached CPU layers only (up/down share the same ids)
+        if (t->op != GGML_OP_MUL_MAT_ID || !src0 || !strstr(src0->name, "ffn_gate_exps")) {
+            return false;
+        }
+        int layer = -1;
+        return sscanf(src0->name, "blk.%d.", &layer) == 1 && find(layer) != nullptr;
+    }
+    // data phase: copy the routed ids to host (no graph node, no cross-backend cpy in the graph)
+    int layer = -1;
+    if (sscanf(src0->name, "blk.%d.", &layer) != 1) { return true; }
+    const layer_slots * cls = find(layer);
+    if (!cls || !cls->routed) { return true; }
+    const ggml_tensor * ids = t->src[2];
+    if (!ids || !ggml_is_contiguous(ids)) { return true; }
+    const size_t nb = ggml_nbytes(ids);
+    if (nb > ggml_nbytes(cls->routed)) { return true; } // n_tokens exceeded n_ubatch (guard)
+    ggml_backend_tensor_get(ids, cls->routed->data, 0, nb); // [n_expert_used, n_tokens] prefix of routed
+    return true;
 }
 
 void llama_moe_slot_cache::update_after_decode(int n_tokens) {

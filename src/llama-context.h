@@ -40,6 +40,13 @@ struct llama_memory_buffer {
 
 using llama_memory_buffers = std::map<ggml_backend_buffer_type_t, llama_memory_buffer>;
 
+// muxes the sched eval callback between the slot cache's routing capture and any tool callback (trace)
+struct llama_moe_eval_mux_t {
+    ggml_backend_sched_eval_callback tool_cb = nullptr;
+    void * tool_ud = nullptr;
+    llama_moe_slot_cache * cache = nullptr;
+};
+
 struct llama_context {
     // init scheduler and compute buffers, reserve worst-case graphs
     llama_context(
@@ -285,6 +292,7 @@ private:
 
     // env-gated persistent GPU expert slot cache (GGML_MOE_SLOT_CACHE); null when disabled
     std::unique_ptr<llama_moe_slot_cache> moe_cache;
+    llama_moe_eval_mux_t moe_eval_mux; // sched-eval-callback mux (cache routing capture + tool cb)
 
     llama_memory_ptr memory;
 
