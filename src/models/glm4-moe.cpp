@@ -144,8 +144,10 @@ llama_model_glm4_moe::graph::graph(const llama_model & model, const llm_graph_pa
     inpL = build_inp_embd(model.tok_embd);
 
     bool use_mrope = hparams.use_mrope();
-    if (ubatch.embd && !use_mrope) {
-        // unfortunately, we need to forcefully stop here, to avoid users complaining about wrong results
+    if (ubatch.embd && !use_mrope && !cparams.embeddings_nextn) {
+        // unfortunately, we need to forcefully stop here, to avoid users complaining about wrong results.
+        // exception: the MTP/NextN speculative path (cparams.embeddings_nextn) legitimately feeds hidden
+        // states as embd input; that is not multimodal and must be allowed through.
         GGML_ABORT("This GGUF does not support multimodal. Please reconvert it.");
     }
 
