@@ -1695,7 +1695,7 @@ int llama_context::decode(const llama_batch & batch_inp) {
     }
 
     if (moe_cache && !moe_cache->initialized) {
-        moe_cache->init(model);
+        moe_cache->init(model, (int) model.hparams.n_expert_used, (int) cparams.n_ubatch);
     }
 
     const auto & vocab   = model.vocab;
@@ -1847,6 +1847,11 @@ int llama_context::decode(const llama_batch & batch_inp) {
         ggml_status status;
 
         const auto * res = process_ubatch(ubatch, ctx_type_to_graph_type(cparams.ctx_type), mctx.get(), status);
+
+        if (res && moe_cache && !cparams.warmup) {
+            // promote this ubatch's routed misses into GPU slots for the next tokens (phase 1: sync)
+            moe_cache->update_after_decode(ubatch.n_tokens);
+        }
 
         if (!res) {
             // the last ubatch failed or was aborted -> remove all positions of that ubatch from the memory module

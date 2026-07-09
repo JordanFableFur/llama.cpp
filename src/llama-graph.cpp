@@ -1979,6 +1979,18 @@ ggml_tensor * llm_graph_context::build_moe_ffn(
         return build_lora_mm_id(w, in, selected_experts, w_s);
     };
 
+    // capture this layer's routed ids into the cache's CPU sink for the post-decode LRU/promotion
+    // update. Guarded on the used-expert count so warmup (ne[0]=n_expert) is skipped cleanly.
+    if (moe_cache) {
+        const llama_moe_slot_cache::layer_slots * ls = moe_cache->find(il);
+        if (ls && ls->routed && selected_experts->ne[0] == ls->routed->ne[0] &&
+            selected_experts->ne[1] <= ls->routed->ne[1]) {
+            ggml_tensor * sink = ggml_view_2d(ctx0, ls->routed,
+                    selected_experts->ne[0], selected_experts->ne[1], ls->routed->nb[1], 0);
+            ggml_build_forward_expand(gf, ggml_cpy(ctx0, selected_experts, sink));
+        }
+    }
+
     ggml_tensor * up = nullptr;
     ggml_tensor * experts = nullptr;
 

@@ -6,6 +6,7 @@
 #include "ggml-backend.h"
 #include "ggml-alloc.h"
 
+#include <cstdio>
 #include <cstdlib>
 #include <cstring>
 #include <vector>
@@ -33,13 +34,23 @@ void llama_moe_slot_cache::promote(layer_slots & ls, int expert_id, int slot) {
     ggml_backend_tensor_set(ls.down, (const char *) ls.src_down->data + (size_t) expert_id * st_d, (size_t) slot * st_d, st_d);
 }
 
-void llama_moe_slot_cache::init(const llama_model & model) {
+llama_moe_slot_cache::~llama_moe_slot_cache() {
+    if (reqs > 0) {
+        // teardown runs after the log backend is gone; write straight to stderr
+        fprintf(stderr, "\n=== MoE slot cache: online hit rate %.1f%% (%llu/%llu requests, %d slots/layer) ===\n",
+                100.0 * (double) hits / (double) reqs, (unsigned long long) hits, (unsigned long long) reqs, n_slots);
+        fflush(stderr);
+    }
+}
+
+void llama_moe_slot_cache::init(const llama_model & model, int n_expert_used_, int n_ubatch) {
     if (initialized) {
         return;
     }
     initialized = true;
 
-    const int n_expert = (int) model.hparams.n_expert;
+    n_expert       = (int) model.hparams.n_expert;
+    n_expert_used  = n_expert_used_;
     if (n_expert <= 0) {
         LLAMA_LOG_INFO("%s: model is not MoE; slot cache inactive\n", __func__);
         return;
@@ -112,22 +123,25 @@ void llama_moe_slot_cache::init(const llama_model & model) {
     // weights); one small I8 [n_expert] tensor per cached layer, all in one CPU buffer.
     if (!layers.empty()) {
         ggml_init_params ipc = {
-            /*.mem_size   =*/ (layers.size() + 1) * ggml_tensor_overhead(),
+            /*.mem_size   =*/ (2 * layers.size() + 1) * ggml_tensor_overhead(),
             /*.mem_buffer =*/ nullptr,
             /*.no_alloc   =*/ true,
         };
         ggml_context * ctx_cpu = ggml_init(ipc);
         for (auto & ls : layers) {
-            ls.skip = ggml_new_tensor_1d(ctx_cpu, GGML_TYPE_I8, n_expert);
+            ls.skip   = ggml_new_tensor_1d(ctx_cpu, GGML_TYPE_I8,  n_expert);
+            ls.routed = ggml_new_tensor_2d(ctx_cpu, GGML_TYPE_I32, n_expert_used, n_ubatch);
         }
         ggml_backend_buffer_t buf_cpu = ggml_backend_alloc_ctx_tensors_from_buft(ctx_cpu, ggml_backend_cpu_buffer_type());
         if (!buf_cpu) {
-            LLAMA_LOG_ERROR("%s: skip-mask CPU buffer alloc FAILED\n", __func__);
+            LLAMA_LOG_ERROR("%s: skip/routed CPU buffer alloc FAILED\n", __func__);
             ggml_free(ctx_cpu);
             return;
         }
         std::vector<int8_t> zeros(n_expert, 0);
         for (auto & ls : layers) {
+            ls.skip_host.assign(n_expert, 0);
+            ls.mru.clear();
             ggml_backend_tensor_set(ls.skip, zeros.data(), 0, ggml_nbytes(ls.skip)); // empty: skip nothing
         }
         ctxs.emplace_back(ctx_cpu);
@@ -147,5 +161,55 @@ void llama_moe_slot_cache::init(const llama_model & model) {
         const bool ok = memcmp(back.data(), (const char *) ls.src_gate->data, st) == 0;
         LLAMA_LOG_INFO("%s: M2 promote self-test (layer %d expert 0 -> slot 0, gate %zu B): %s\n",
                        __func__, ls.il, st, ok ? "MATCH" : "MISMATCH");
+    }
+}
+
+void llama_moe_slot_cache::update_after_decode(int n_tokens) {
+    if (!initialized || layers.empty()) {
+        return;
+    }
+    for (auto & ls : layers) {
+        const int32_t * routed = (const int32_t *) ls.routed->data; // [n_expert_used, n_ubatch]
+        bool dirty = false;
+        for (int t = 0; t < n_tokens; ++t) {
+            for (int k = 0; k < n_expert_used; ++k) {
+                const int e = routed[k + t*n_expert_used];
+                if (e < 0 || e >= n_expert) {
+                    continue;
+                }
+                reqs++;
+                if (ls.e2s_host[e] != n_slots) {
+                    // resident (was GPU-computed this token): a hit; refresh recency
+                    hits++;
+                    for (size_t i = 0; i < ls.mru.size(); ++i) {
+                        if (ls.mru[i] == e) {
+                            if (i != 0) { ls.mru.erase(ls.mru.begin() + i); ls.mru.insert(ls.mru.begin(), e); }
+                            break;
+                        }
+                    }
+                    continue;
+                }
+                // miss: pick a slot (next free while warming, else evict the LRU expert), promote
+                int slot;
+                if ((int) ls.mru.size() < n_slots) {
+                    slot = (int) ls.mru.size();
+                } else {
+                    const int victim = ls.mru.back();
+                    ls.mru.pop_back();
+                    slot = ls.e2s_host[victim];
+                    ls.e2s_host[victim]  = n_slots;
+                    ls.skip_host[victim] = 0;
+                }
+                promote(ls, e, slot);
+                ls.e2s_host[e]  = slot;
+                ls.skip_host[e] = 1;
+                ls.mru.insert(ls.mru.begin(), e);
+                dirty = true;
+            }
+        }
+        if (dirty) {
+            ggml_backend_tensor_set(ls.e2s,  ls.e2s_host.data(),  0, ggml_nbytes(ls.e2s));
+            ggml_backend_tensor_set(ls.skip, ls.skip_host.data(), 0, ggml_nbytes(ls.skip));
+        }
     }
 }
