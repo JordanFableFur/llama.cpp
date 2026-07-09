@@ -770,3 +770,34 @@ token, serializing the pipeline. It WORSENS with S (bigger slot `mul_mat_id`): S
 wall (19→5.6 at S=8, 18.4→1.5 at S=48) is **exactly what P3.1 conditional elision removes** — a
 fully-resident layer goes GPU-only (no CPU op, no split). P3.1 is now the decisive test, and its target
 cost is cleanly measured rather than assumed. **STOP for review before P3.1 per standing conditions.**
+
+## P3.1 amendment (Fable, 2026-07-09) — binary dispatch; two-path retired everywhere
+
+P3.0's NOCAP cell changes the partial-layer economics: a two-path layer costs ~3.5 ms (S=8) to
+~17 ms (S=48); with 5-8 any-miss layers/token the original P3.1 (elide full, two-path partial)
+loses to the champion even working perfectly. Amendments:
+
+1. **Binary per-layer dispatch.** Fully-resident (per boundary-published map) -> GPU-only slot
+   path, CPU op and activation round-trip elided. Any-miss -> the PLAIN CPU path: all 4 experts
+   on CPU (skip-op with all-compute mask, so fused capture rides along), no slot matmul, no
+   combine, no split. A plain CPU layer is ~1.4 ms vs the split's 3.5-17 ms; sacrificing GPU
+   compute for partial layers' hits is a clear win. The two-path structure retires from the
+   design entirely.
+2. **Elided-layer capture gap + fix candidate.** Elided layers run no CPU op -> ids never reach
+   host -> LRU blind exactly where the cache succeeds. Candidate: batched same-backend GPU-sink
+   for elided layers only, one D2H post-compute. NOTE: the GPU-sink's 5.2 tg verdict was
+   measured ON TOP of the two-path (contaminated, like every phase-2 capture number); its clean
+   cost is unknown.
+3. **Pre-measurements (before any build):**
+   (a) NOBOOK + batched GPU-sink, capture-only — the uncontaminated cell. tg ~= NOBOOK ->
+       elided capture solved; collapse -> phase 3 needs capture-free residency tracking, stop
+       and re-scope.
+   (b) Graph-reuse loss (unchanged): per-token topology toggle vs stable, no cache.
+   The split-cost-vs-K curve is moot under binary dispatch (no splits remain).
+4. **Cost model (measured terms + the two unknowns):** ~4 ms GPU base + (5-8 partial layers x
+   ~1.4 ms) + reuse tax (3b) + capture (3a) ~= 13-16 ms/token -> 60-75 tg naive ceiling; sober
+   band 35-50. Ship bar unchanged: >= 32.7 tg equal-VRAM, p99 not worse, warmup reported.
+5. **Process note (third misattribution, for the report):** phase 2's capture A/B lacked the
+   all-off control (two-path with NO capture); every mechanism verdict inherited the two-path
+   collapse. Standing rule: an A/B over mechanisms is uninterpretable without the
+   everything-off cell measured on the same substrate.
