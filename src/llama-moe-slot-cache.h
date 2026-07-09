@@ -36,6 +36,13 @@ struct llama_moe_slot_cache {
     // phase-2 addendum). Promotions run off the decode stream; the compute map (e2s/skip) is only
     // updated once event_query confirms the copy landed. Off => promote() synchronous (phase 1).
     bool         async_promote  = false;
+    bool         compute_disabled = false; // GGML_MOE_SLOT_NOSLOT: keep bookkeeping, use plain CPU
+                                           // compute path (no GPU slot / combine) - isolates the
+                                           // two-path compute cost from cache bookkeeping cost
+    bool         book_disabled = false;    // GGML_MOE_SLOT_NOBOOK: also skip cpy-sink + update
+                                           // (pure allocation) - isolates allocation vs bookkeeping
+    bool         promo_disabled = false;   // GGML_MOE_SLOT_NOPROMO: cpy-sink ON, update OFF -
+                                           // isolates the graph cpy-sink cost from promotion
     int          ring_size      = 32;    // pinned staging buffers = max promotions in flight (knob)
     int          promote_budget = 32;    // max promotions ENQUEUED per token, GLOBAL across layers (knob)
     ggml_backend_t copy_backend = nullptr;

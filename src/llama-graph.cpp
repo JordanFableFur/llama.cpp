@@ -1958,7 +1958,7 @@ ggml_tensor * llm_graph_context::build_moe_ffn(
     // to build_lora_mm_id. Falls through unchanged when uncached / scaled / LoRA'd / non-contiguous.
     auto moe_expert_mm = [&](ggml_tensor * w, ggml_tensor * in, ggml_tensor * w_s) -> ggml_tensor * {
         const llama_moe_slot_cache::layer_slots * ls = moe_cache ? moe_cache->find(il) : nullptr;
-        if (ls && !w_s && ggml_is_contiguous(selected_experts)) {
+        if (ls && !moe_cache->compute_disabled && !w_s && ggml_is_contiguous(selected_experts)) {
             bool has_lora = false;
             for (const auto & lora : *loras) {
                 if (lora.first->get_weight(w)) { has_lora = true; break; }
@@ -1981,7 +1981,7 @@ ggml_tensor * llm_graph_context::build_moe_ffn(
 
     // capture this layer's routed ids into the cache's CPU sink for the post-decode LRU/promotion
     // update. Guarded on the used-expert count so warmup (ne[0]=n_expert) is skipped cleanly.
-    if (moe_cache) {
+    if (moe_cache && !moe_cache->book_disabled) {
         const llama_moe_slot_cache::layer_slots * ls = moe_cache->find(il);
         if (ls && ls->routed && selected_experts->ne[0] == ls->routed->ne[0] &&
             selected_experts->ne[1] <= ls->routed->ne[1]) {

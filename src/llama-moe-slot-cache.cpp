@@ -24,6 +24,10 @@ std::unique_ptr<llama_moe_slot_cache> llama_moe_slot_cache::maybe_create_from_en
     }
     auto cache = std::make_unique<llama_moe_slot_cache>(s);
     cache->async_promote = getenv("GGML_MOE_SLOT_SYNC") == nullptr; // async (phase 2) default; SYNC=1 => phase 1
+    cache->compute_disabled = getenv("GGML_MOE_SLOT_NOSLOT") != nullptr; // isolate bookkeeping vs two-path
+    cache->book_disabled    = getenv("GGML_MOE_SLOT_NOBOOK") != nullptr; // isolate allocation vs bookkeeping
+    if (cache->book_disabled) { cache->compute_disabled = true; }        // NOBOOK implies no slot compute
+    cache->promo_disabled   = getenv("GGML_MOE_SLOT_NOPROMO") != nullptr; // cpy-sink on, update off
     if (const char * r = getenv("GGML_MOE_SLOT_RING")) {
         const int rr = atoi(r);
         if (rr > 0) { cache->ring_size = rr; }

@@ -1848,7 +1848,7 @@ int llama_context::decode(const llama_batch & batch_inp) {
 
         const auto * res = process_ubatch(ubatch, ctx_type_to_graph_type(cparams.ctx_type), mctx.get(), status);
 
-        if (res && moe_cache && !cparams.warmup) {
+        if (res && moe_cache && !cparams.warmup && !moe_cache->book_disabled && !moe_cache->promo_disabled) {
             // promote this ubatch's routed misses into GPU slots for the next tokens (phase 1: sync)
             moe_cache->update_after_decode(ubatch.n_tokens);
         }

@@ -73,6 +73,55 @@ def next_use(seq):
     nxt[order[:-1][same]] = order[1:][same]
     return nxt
 
+# ---------------- full-residency rate (phase-3 viability) ----------------
+# P(all n_expert_used routed experts of a layer are resident at the token) under per-layer LRU(S).
+# A layer is fully resident on a token => phase 3 can run pure GPU slot path, no CPU op / DtoH /
+# combine. frac_partial = 1 - P(full) is the fraction of layer-tokens that still pay the split cost.
+def residency_full(reqs, layers, neu, S):
+    full = tot = 0
+    per_layer = {}
+    for L in layers:
+        seq = reqs[L]                    # [T, neu]
+        T = seq.shape[0]
+        cache = collections.OrderedDict()
+        lfull = 0
+        for t in range(T):
+            row = seq[t]
+            resident = all((int(e) in cache) for e in row)  # BEFORE this token's promotions
+            if resident:
+                lfull += 1
+            for e in row:
+                e = int(e)
+                if e in cache:
+                    cache.move_to_end(e)
+                else:
+                    if len(cache) >= S:
+                        cache.popitem(last=False)
+                    cache[e] = 1
+        full += lfull; tot += T
+        per_layer[L] = lfull / T if T else 0.0
+    return full / tot if tot else 0.0, per_layer
+
+def residency(specs):
+    workloads = {}
+    for spec in specs:
+        name, paths = spec.split('=', 1)
+        plist = paths.split(',')
+        workloads[name] = parse_merge(plist) if len(plist) > 1 else parse_trace(plist[0])
+    for name, (n_expert, neu, layers, T, reqs) in workloads.items():
+        print(f"\n=== full-residency P(all {neu} routed experts resident) : {name} ({T} tok) ===")
+        hdr = "slots/layer | " + " | ".join(f"{s:>5}" for s in SLOTS)
+        print(hdr); print("-"*len(hdr))
+        row_hit = []; row_full = []
+        for S in SLOTS:
+            hit = sim_perlayer(reqs, layers, neu, S, 'lru')
+            pf, per = residency_full(reqs, layers, neu, S)
+            row_hit.append(hit); row_full.append(pf)
+        print("per-expert hit  | " + " | ".join(f"{h*100:5.1f}" for h in row_hit))
+        print("P(layer full)   | " + " | ".join(f"{f*100:5.1f}" for f in row_full))
+        # naive independence prediction hit^neu for reference
+        print("hit^neu (indep) | " + " | ".join(f"{(h**neu)*100:5.1f}" for h in row_hit))
+
 # ---------------- per-layer independent pools (S slots each) ----------------
 def sim_perlayer(reqs, layers, neu, S, policy, decay=0.98):
     hits = reqs_total = 0
@@ -217,9 +266,11 @@ def sim(specs):
             sys.stdout.flush()
 
 if __name__ == "__main__":
-    if len(sys.argv) < 3 or sys.argv[1] not in ("verify", "sim"):
+    if len(sys.argv) < 3 or sys.argv[1] not in ("verify", "sim", "residency"):
         print(__doc__); sys.exit(1)
     if sys.argv[1] == "verify":
         verify(sys.argv[2], sys.argv[3])
+    elif sys.argv[1] == "residency":
+        residency(sys.argv[2:])
     else:
         sim(sys.argv[2:])
