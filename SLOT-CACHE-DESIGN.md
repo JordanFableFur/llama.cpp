@@ -488,3 +488,30 @@ but NO non-blocking event query. The spec's token-boundary poll (point 1) wants 
   immediately - effectively non-blocking) then update the map. No new API, but a subtle "rarely
   blocks" caveat if a copy overruns a token.
 Lean (A): cleaner, no caveat, and event_query is a generally useful primitive. Awaiting owner call.
+
+### Phase 2 progress. Pause (ii): async promotion CORRECT, nsys taken. Two findings before the bench matrix.
+Async promotion landed on experiments/slot-cache (1849fcd27). Correctness: ppl 458.9669 ==
+baseline (byte-identical); all carry-forward unit oracles re-run PASS; token-agreement identical.
+
+**nsys trace (bench-results/p2-trace.nsys-rep, generation window, ncmoe36 S=8):**
+- Compute kernels on stream 15 (2125), cleanly separate from transfers -> promotions do NOT block
+  the compute stream (gate 6a's core intent holds; no new decode-compute-stream sync observed).
+- Promotions (pinned HtoD from the ring): 2049 ops / 1116 MiB on streams 14 (1821) + 16 (228),
+  async, ring cycling under load.
+- **DtoH DOMINATES: 162 GB Device-to-Host on stream 14 (90.7% of memcpy time)** - the ncmoe-36
+  CPU-expert activation round-trips, inherent to offload, NOT the cache. Most promotions share
+  stream 14 with this flood (imperfect copy-stream isolation).
+
+**Findings / recommendations for the bench matrix (owner decision, pause ii):**
+1. **Ring starvation is the blocker.** 2-buffer ring polled once/token -> ~2 promotions/token vs
+   ~144 misses/token across 36 layers -> hit rate collapses to 2.7% (S=8) / 14.1% (S=32) vs sync's
+   43.6% / 90.4%. The cache never warms, so it adds overhead (doubled matmul + cpy-sink + poll)
+   without payoff -> tg 4.20 (S=8) barely above sync 3.49, both << baseline 19.40. FIX: many more
+   ring buffers (e.g. 16-32) + higher budget so promotion keeps pace with misses. The spec's
+   2x16 MiB was too conservative for a 36-layer model.
+2. **ncmoe 36 is the wrong evaluation point** - it is DtoH-activation-bound (162 GB), so the cache
+   can only help by cutting CPU compute via HIGH hit rate. The equal-VRAM verdict (finding 1)
+   belongs at ncmoe ~26-28 where fewer layers round-trip. Also investigate the stream-14 promotion
+   sharing (copy_backend should be fully dedicated).
+Recommend: un-starve the ring (fix 1), then run the equal-VRAM matrix at ncmoe 26-28. Paused for
+owner direction before the bench matrix.
