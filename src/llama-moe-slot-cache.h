@@ -43,8 +43,17 @@ struct llama_moe_slot_cache {
                                            // (pure allocation) - isolates allocation vs bookkeeping
     bool         promo_disabled = false;   // GGML_MOE_SLOT_NOPROMO: cpy-sink ON, update OFF -
                                            // isolates the graph cpy-sink cost from promotion
-    bool         use_cpysink = false;      // GGML_MOE_SLOT_CPYSINK: route capture via a graph cpy
-                                           // node (old path) instead of the eval callback (A/B)
+    int          capture_mode = 0;         // routing capture: 0 = GPU-sink (default: GPU->GPU cpy +
+                                           // one batched D2H, no split, fast path preserved);
+                                           // 1 = eval callback (GGML_MOE_SLOT_CALLBACK, diagnostic);
+                                           // 2 = CPU cpy-sink (GGML_MOE_SLOT_CPYSINK, diagnostic)
+    int          n_ubatch = 0;
+    // GPU-sink: one persistent [n_expert_used, n_ubatch, n_layers] i32 GPU tensor; each cached layer
+    // cpys its routed ids to its z-slice (GPU->GPU, no graph split); one D2H per token into routed_host.
+    ggml_context_ptr        routed_ctx;
+    ggml_backend_buffer_ptr routed_buf;
+    ggml_tensor *           routed_gpu = nullptr;
+    std::vector<int32_t>    routed_host;
     int          ring_size      = 32;    // pinned staging buffers = max promotions in flight (knob)
     int          promote_budget = 32;    // max promotions ENQUEUED per token, GLOBAL across layers (knob)
     ggml_backend_t copy_backend = nullptr;
@@ -111,6 +120,25 @@ struct llama_moe_slot_cache {
             }
         }
         return nullptr;
+    }
+
+    // index of layer il within `layers` (its z-slice in routed_gpu), or -1 if not cached
+    int find_pos(int il) const {
+        for (int i = 0; i < (int) layers.size(); ++i) {
+            if (layers[i].il == il) { return i; }
+        }
+        return -1;
+    }
+
+    // GPU-sink: one batched D2H of routed_gpu into routed_host (called at the token boundary)
+    void download_routing();
+
+    // routing ids for layer at position `pos` this eval (source depends on capture_mode)
+    const int32_t * layer_routing(int pos) const {
+        if (capture_mode == 0) {
+            return routed_host.data() + (size_t) pos * n_expert_used * n_ubatch;
+        }
+        return (const int32_t *) layers[pos].routed->data;
     }
 
     // synchronous promotion: copy expert_id's weights into slot on the GPU (phase 1)

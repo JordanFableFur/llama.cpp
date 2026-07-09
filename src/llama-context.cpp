@@ -1347,8 +1347,8 @@ llm_graph_result * llama_context::process_ubatch(const llama_ubatch & ubatch, ll
         res->reset();
 
         ggml_backend_sched_reset(sched.get());
-        if (moe_cache && !moe_cache->book_disabled && !moe_cache->use_cpysink) {
-            // route capture through the eval callback (no graph cpy-sink); mux with any tool callback
+        if (moe_cache && !moe_cache->book_disabled && moe_cache->capture_mode == 1) {
+            // route capture through the eval callback (mode 1, diagnostic); mux with any tool callback
             moe_eval_mux.tool_cb = cparams.cb_eval;
             moe_eval_mux.tool_ud = cparams.cb_eval_user_data;
             moe_eval_mux.cache   = moe_cache.get();

@@ -1979,14 +1979,26 @@ ggml_tensor * llm_graph_context::build_moe_ffn(
         return build_lora_mm_id(w, in, selected_experts, w_s);
     };
 
-    // capture this layer's routed ids into the cache's CPU sink for the post-decode LRU/promotion
-    // update. Guarded on the used-expert count so warmup (ne[0]=n_expert) is skipped cleanly.
-    if (moe_cache && !moe_cache->book_disabled && moe_cache->use_cpysink) {
-        const llama_moe_slot_cache::layer_slots * ls = moe_cache->find(il);
-        if (ls && ls->routed && selected_experts->ne[0] == ls->routed->ne[0] &&
-            selected_experts->ne[1] <= ls->routed->ne[1]) {
-            ggml_tensor * sink = ggml_view_2d(ctx0, ls->routed,
-                    selected_experts->ne[0], selected_experts->ne[1], ls->routed->nb[1], 0);
+    // capture this layer's routed ids for the post-decode LRU/promotion update. Default (mode 0) is
+    // the GPU-sink: a GPU->GPU cpy to routed_gpu's z-slice (no graph split, fast path preserved),
+    // downloaded once per token. Mode 2 is the CPU cpy-sink (diagnostic). Mode 1 (callback) and
+    // book_disabled add no node here. Guarded on the used-expert count so warmup is skipped cleanly.
+    if (moe_cache && !moe_cache->book_disabled &&
+        (moe_cache->capture_mode == 0 || moe_cache->capture_mode == 2)) {
+        const int pos = moe_cache->find_pos(il);
+        if (pos >= 0 && ggml_is_contiguous(selected_experts) &&
+            selected_experts->ne[0] == moe_cache->n_expert_used &&
+            selected_experts->ne[1] <= moe_cache->n_ubatch) {
+            const int64_t neu = selected_experts->ne[0];
+            const int64_t nt  = selected_experts->ne[1];
+            ggml_tensor * sink;
+            if (moe_cache->capture_mode == 0) {
+                sink = ggml_view_2d(ctx0, moe_cache->routed_gpu, neu, nt,
+                        moe_cache->routed_gpu->nb[1], (size_t) pos * moe_cache->routed_gpu->nb[2]);
+            } else {
+                const llama_moe_slot_cache::layer_slots * ls = moe_cache->find(il);
+                sink = ggml_view_2d(ctx0, ls->routed, neu, nt, ls->routed->nb[1], 0);
+            }
             ggml_build_forward_expand(gf, ggml_cpy(ctx0, selected_experts, sink));
         }
     }

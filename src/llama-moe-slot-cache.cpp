@@ -28,7 +28,9 @@ std::unique_ptr<llama_moe_slot_cache> llama_moe_slot_cache::maybe_create_from_en
     cache->book_disabled    = getenv("GGML_MOE_SLOT_NOBOOK") != nullptr; // isolate allocation vs bookkeeping
     if (cache->book_disabled) { cache->compute_disabled = true; }        // NOBOOK implies no slot compute
     cache->promo_disabled   = getenv("GGML_MOE_SLOT_NOPROMO") != nullptr; // cpy-sink on, update off
-    cache->use_cpysink      = getenv("GGML_MOE_SLOT_CPYSINK") != nullptr; // A/B: graph cpy-sink vs callback
+    if      (getenv("GGML_MOE_SLOT_CALLBACK")) { cache->capture_mode = 1; } // eval callback (diagnostic)
+    else if (getenv("GGML_MOE_SLOT_CPYSINK"))  { cache->capture_mode = 2; } // CPU cpy-sink (diagnostic)
+    else                                       { cache->capture_mode = 0; } // GPU-sink (default)
     if (const char * r = getenv("GGML_MOE_SLOT_RING")) {
         const int rr = atoi(r);
         if (rr > 0) { cache->ring_size = rr; }
@@ -78,7 +80,7 @@ llama_moe_slot_cache::~llama_moe_slot_cache() {
     }
 }
 
-void llama_moe_slot_cache::init(const llama_model & model, int n_expert_used_, int n_ubatch) {
+void llama_moe_slot_cache::init(const llama_model & model, int n_expert_used_, int n_ubatch_) {
     if (initialized) {
         return;
     }
@@ -86,6 +88,7 @@ void llama_moe_slot_cache::init(const llama_model & model, int n_expert_used_, i
 
     n_expert       = (int) model.hparams.n_expert;
     n_expert_used  = n_expert_used_;
+    n_ubatch       = n_ubatch_;
     if (n_expert <= 0) {
         LLAMA_LOG_INFO("%s: model is not MoE; slot cache inactive\n", __func__);
         return;
@@ -182,6 +185,24 @@ void llama_moe_slot_cache::init(const llama_model & model, int n_expert_used_, i
         }
         ctxs.emplace_back(ctx_cpu);
         bufs.emplace_back(buf_cpu);
+    }
+
+    // GPU-sink capture (default): one [n_expert_used, n_ubatch, n_layers] i32 GPU tensor. Each cached
+    // layer cpys its routed ids to its z-slice (GPU->GPU, no graph split); one batched D2H per token.
+    if (capture_mode == 0 && !layers.empty()) {
+        ggml_backend_buffer_type_t buft = ggml_backend_dev_buffer_type(model.dev_layer(layers[0].il));
+        ggml_init_params ipg = { 2 * ggml_tensor_overhead(), nullptr, /*.no_alloc=*/ true };
+        ggml_context * ctx_g = ggml_init(ipg);
+        routed_gpu = ggml_new_tensor_3d(ctx_g, GGML_TYPE_I32, n_expert_used, n_ubatch, (int64_t) layers.size());
+        ggml_backend_buffer_t buf_g = ggml_backend_alloc_ctx_tensors_from_buft(ctx_g, buft);
+        if (!buf_g) {
+            LLAMA_LOG_ERROR("%s: routed_gpu buffer alloc FAILED\n", __func__);
+            ggml_free(ctx_g);
+            return;
+        }
+        routed_host.assign((size_t) n_expert_used * n_ubatch * layers.size(), 0);
+        routed_ctx.reset(ctx_g);
+        routed_buf.reset(buf_g);
     }
 
     // phase-2: dedicated copy stream (separate backend instance) + pinned staging ring
@@ -294,11 +315,19 @@ bool llama_moe_slot_cache::eval_capture(struct ggml_tensor * t, bool ask) {
     return true;
 }
 
+void llama_moe_slot_cache::download_routing() {
+    if (capture_mode == 0 && routed_gpu) {
+        // one batched D2H at the token boundary (pipeline already idle): all layers' ids at once
+        ggml_backend_tensor_get(routed_gpu, routed_host.data(), 0, ggml_nbytes(routed_gpu));
+    }
+}
+
 void llama_moe_slot_cache::update_after_decode(int n_tokens) {
     if (!initialized || layers.empty()) {
         return;
     }
     const auto t_begin = std::chrono::steady_clock::now();
+    download_routing(); // GPU-sink: bring this eval's routed ids to host in one copy
     if (async_promote) {
         poll_completions(); // land finished promotions first (frees rings, publishes maps)
     }
@@ -315,7 +344,7 @@ void llama_moe_slot_cache::update_after_decode(int n_tokens) {
     int budget = promote_budget; // GLOBAL per-token promotion budget (FIFO across layers)
     for (int li = 0; li < (int) layers.size(); ++li) {
         layer_slots & ls = layers[li];
-        const int32_t * routed = (const int32_t *) ls.routed->data; // [n_expert_used, n_ubatch]
+        const int32_t * routed = layer_routing(li); // GPU-sink: routed_host slice; else ls.routed
         bool sync_dirty = false;
         for (int t = 0; t < n_tokens; ++t) {
             for (int k = 0; k < n_expert_used; ++k) {
